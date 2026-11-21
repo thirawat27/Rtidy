@@ -53,6 +53,22 @@ pub fn setup(target_dir: Option<PathBuf>, lean: bool) -> Result<()> {
     Ok(())
 }
 
+/// Idempotent: keep an existing shared dir, otherwise create the default one.
+pub fn ensure_setup(lean: bool) -> Result<()> {
+    if shared_target_dir()?.is_none() {
+        return setup(None, lean);
+    }
+    if lean {
+        let (path, text, mut doc) = read_cargo_config()?;
+        if !is_lean(&doc) {
+            set_lean(&mut doc);
+            write_cargo_config(&path, &text, &doc)?;
+            say!("lean: dependencies build without debug info");
+        }
+    }
+    Ok(())
+}
+
 /// Dependencies without debug info: often halves target size and speeds up linking.
 /// Your workspace crates keep full debug info, so debugging your code is unaffected.
 fn set_lean(doc: &mut toml_edit::DocumentMut) {

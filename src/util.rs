@@ -13,8 +13,14 @@ pub fn enable_file_log() {
     LOG_TO_FILE.store(true, Ordering::Relaxed);
 }
 
+/// Messages for the GUI log panel (drained by the GUI each frame).
+pub static LOG_LINES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 pub fn say(msg: &str) {
     println!("{msg}");
+    if let Ok(mut v) = LOG_LINES.lock() {
+        v.push(msg.to_string());
+    }
     if LOG_TO_FILE.load(Ordering::Relaxed) {
         if let Ok(path) = log_path() {
             if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
@@ -143,6 +149,18 @@ pub fn write_cargo_config(path: &Path, old_text: &str, doc: &toml_edit::Document
 pub fn plain(p: &Path) -> String {
     let s = p.display().to_string();
     s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s)
+}
+
+/// A Command that never flashes a console window on Windows (we may be a GUI app).
+pub fn quiet_cmd(program: &str) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut c = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    c
 }
 
 pub fn free_space(p: &Path) -> Option<u64> {

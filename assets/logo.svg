@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FF8A3D"/>
+      <stop offset="1" stop-color="#E0342B"/>
+    </linearGradient>
+    <linearGradient id="top" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#FFE9DC"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#bg)"/>
+  <!-- isometric box = a build artifact, neatly packed -->
+  <g transform="translate(118 140)">
+    <path d="M0 -62 L58 -30 L0 2 L-58 -30 Z" fill="url(#top)"/>
+    <path d="M-58 -30 L0 2 L0 70 L-58 38 Z" fill="#FFFFFF" fill-opacity="0.78"/>
+    <path d="M58 -30 L0 2 L0 70 L58 38 Z" fill="#FFFFFF" fill-opacity="0.55"/>
+    <path d="M-29 -46 L29 -14" stroke="#E0342B" stroke-opacity="0.35" stroke-width="8" stroke-linecap="round"/>
+  </g>
+  <!-- sparkle = clean -->
+  <path d="M192 44 C195 62 200 67 218 70 C200 73 195 78 192 96 C189 78 184 73 166 70 C184 67 189 62 192 44 Z" fill="#FFFFFF"/>
+  <path d="M206 108 C207.5 116 210 118.5 218 120 C210 121.5 207.5 124 206 132 C204.5 124 202 121.5 194 120 C202 118.5 204.5 116 206 108 Z" fill="#FFFFFF" fill-opacity="0.85"/>
+</svg>
