@@ -137,15 +137,33 @@ jobs:
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Release when a v* tag is pushed, or when main gets a version that has no release yet.
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+      - name: Decide
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          [[ "$GITHUB_REF" == refs/tags/v* ]] && v="${GITHUB_REF_NAME#v}"
+          echo "tag=v$v" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]] || ! gh release view "v$v" >/dev/null 2>&1; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/download-artifact@v4
+        if: steps.v.outputs.go == 'true'
         with:
           pattern: dist-*
           path: dist
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
+        if: steps.v.outputs.go == 'true'
         with:
+          tag_name: ${{ steps.v.outputs.tag }}
+          name: rtidy ${{ steps.v.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: dist/*
           generate_release_notes: true
