@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 
 pub const TASK_NAME: &str = "rtidy";
+#[allow(dead_code)]
 const CRON_TAG: &str = "# rtidy-auto";
 #[allow(dead_code)]
 const LAUNCHD_LABEL: &str = "dev.rtidy.auto";
