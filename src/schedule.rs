@@ -28,6 +28,15 @@ pub fn exe_path() -> Result<PathBuf> {
     Ok(std::env::current_exe()?)
 }
 
+/// Running from somewhere that will disappear (a mounted .dmg, macOS App Translocation):
+/// a scheduled task pointing there would break.
+pub fn exe_looks_temporary() -> bool {
+    exe_path().is_ok_and(|p| {
+        let s = p.to_string_lossy();
+        s.contains("AppTranslocation") || (cfg!(target_os = "macos") && s.starts_with("/Volumes/"))
+    })
+}
+
 fn parse_at(at: &str) -> Result<(u32, u32)> {
     let (h, m) = at.trim().split_once(':').context("time must be HH:MM")?;
     let (h, m): (u32, u32) = (h.parse()?, m.parse()?);

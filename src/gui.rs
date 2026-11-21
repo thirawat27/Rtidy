@@ -791,6 +791,12 @@ impl App {
             "Clean up automatically every day",
             &format!("Runs quietly in the background via {mech}"),
         );
+        if self.cfg.auto_enabled && crate::schedule::exe_looks_temporary() {
+            ui.label(
+                RichText::new("⚠  Move rtidy to your Applications folder first, then open it from there — otherwise the daily clean-up can't find it.")
+                    .color(WARN),
+            );
+        }
         if self.cfg.auto_enabled {
             ui.horizontal(|ui| {
                 ui.add_space(56.0);

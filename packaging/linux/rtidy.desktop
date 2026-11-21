@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=rtidy
+GenericName=Rust target cleaner
+Comment=Keeps your Rust target folders tidy
+Exec=rtidy
+Icon=rtidy
+Terminal=false
+Categories=Development;Utility;
+Keywords=rust;cargo;target;clean;disk;

@@ -1,0 +1,151 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows
+          - os: macos-latest
+            name: macos
+          - os: ubuntu-22.04 # older glibc = runs on more distros
+            name: linux
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.name == 'macos' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Version
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          [[ "$GITHUB_REF" == refs/tags/v* ]] && v="${GITHUB_REF_NAME#v}"
+          echo "RTIDY_VERSION=$v" >> "$GITHUB_ENV"
+          mkdir -p logs dist
+
+      - name: Test
+        run: |
+          set -o pipefail
+          cargo test 2>&1 | tee logs/test.log
+
+      - name: Build (Windows, Linux)
+        if: matrix.name != 'macos'
+        run: |
+          set -o pipefail
+          cargo build --release 2>&1 | tee logs/build.log
+
+      - name: Build (macOS universal)
+        if: matrix.name == 'macos'
+        run: |
+          set -o pipefail
+          cargo build --release --target aarch64-apple-darwin 2>&1 | tee logs/build.log
+          cargo build --release --target x86_64-apple-darwin 2>&1 | tee -a logs/build.log
+          mkdir -p target/release
+          lipo -create -output target/release/rtidy \
+            target/aarch64-apple-darwin/release/rtidy target/x86_64-apple-darwin/release/rtidy
+
+      - name: CLI smoke test
+        run: |
+          set -o pipefail
+          exe=target/release/rtidy
+          [[ "${{ matrix.name }}" == windows ]] && exe=target/release/rtidy.exe
+          mkdir -p smoke/p/target/debug && echo '[package]' > smoke/p/Cargo.toml
+          touch smoke/p/target/CACHEDIR.TAG && head -c 100000 /dev/urandom > smoke/p/target/debug/x
+          {
+            "$exe" --version
+            "$exe" scan smoke
+            "$exe" clean smoke --days 0 --dry-run
+            "$exe" doctor smoke
+          } 2>&1 | tee logs/smoke.log
+
+      - name: Package (Windows installer)
+        if: matrix.name == 'windows'
+        run: |
+          set -o pipefail
+          ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+          [ -f "$ISCC" ] || choco install innosetup -y --no-progress
+          "$ISCC" packaging/windows/rtidy.iss 2>&1 | tee logs/package.log
+          cp target/release/rtidy.exe dist/rtidy-windows-x64-portable.exe
+
+      - name: Package (macOS dmg)
+        if: matrix.name == 'macos'
+        run: |
+          set -o pipefail
+          bash packaging/macos/bundle.sh target/release/rtidy "$RTIDY_VERSION" 2>&1 | tee logs/package.log
+
+      - name: Package (Linux deb, AppImage, tar.gz)
+        if: matrix.name == 'linux'
+        run: |
+          set -o pipefail
+          bash packaging/linux/package.sh target/release/rtidy "$RTIDY_VERSION" 2>&1 | tee logs/package.log
+
+      - name: Record result
+        if: always()
+        run: |
+          echo "${{ matrix.name }}: ${{ job.status }} @ ${GITHUB_SHA::7}" > logs/STATUS
+          ls -la dist >> logs/STATUS 2>&1 || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-${{ matrix.name }}
+          path: logs/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.name }}
+          path: dist/
+
+  # Build logs are committed to the ci-logs branch so they can be read with plain git.
+  report:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: logs-*
+          path: logs
+      - name: Push logs to ci-logs branch
+        run: |
+          cd logs
+          git init -q -b ci-logs
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          echo "run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID  sha: $GITHUB_SHA  result: ${{ needs.build.result }}" > README
+          git add -A && git commit -qm "logs for ${GITHUB_SHA::7}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" ci-logs
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
