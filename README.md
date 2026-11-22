@@ -1,10 +1,9 @@
 <p align="center"><img src="assets/logo.png" width="96" alt="rtidy logo"></p>
 <h1 align="center">rtidy</h1>
-<p align="center">Keeps your Rust <code>target/</code> folders tidy — on Windows, macOS and Linux. English &amp; ไทย.</p>
+<p align="center">Keeps your Rust <code>target/</code> folders tidy — on Windows, macOS and Linux.<br>
+<b>English</b> · <a href="README.th.md">ภาษาไทย</a></p>
 
-<p align="center"><img src="assets/screenshot-dashboard.png" width="720" alt="rtidy dashboard"></p>
-
-<p align="center"><img src="assets/screenshot-insights-th.png" width="720" alt="AI insights in Thai"></p>
+<p align="center"><img src="assets/showcase/tour.gif" width="760" alt="rtidy tour: setup wizard, dashboard, AI insights"></p>
 
 ## The problem
 
@@ -16,9 +15,44 @@ Shared dependencies get compiled again and again, and nothing ever cleans up.
 1. **One shared target folder** — every project builds into the same place (`build.target-dir` in `~/.cargo/config.toml`), so new `target/` folders stop appearing and shared dependencies compile once.
 2. **Lean builds** — dependencies skip debug info (often half the size); your own code keeps it.
 3. **Removes leftovers** — old per-project `target/` folders (except projects marked *Keep*).
-4. **Trims the shared folder** — drops incremental caches, artifacts unused for N days, and keeps it under a size cap.
+4. **Trims the shared folder** — drops incremental caches and artifacts you won't reuse, and keeps it under a size cap.
 5. **Trims the cargo download cache** in `~/.cargo`.
 6. **Cleans itself every day** — Task Scheduler (Windows), launchd (macOS), systemd timer or cron (Linux). Missed runs catch up when the computer is back on.
+
+## Showcase
+
+<table>
+<tr>
+<td width="50%"><img src="assets/showcase/01-welcome.png" alt="Welcome"><br><b>1. Welcome</b> — first launch opens a setup wizard (EN | ไทย).</td>
+<td width="50%"><img src="assets/showcase/02-folders.png" alt="Folders"><br><b>2. Folders</b> — common code folders are detected; add or type your own.</td>
+</tr>
+<tr>
+<td><img src="assets/showcase/03-preferences.png" alt="Preferences"><br><b>3. Preferences</b> — Smart mode, lean builds and daily clean-up, with sensible defaults.</td>
+<td><img src="assets/showcase/04-review.png" alt="Review"><br><b>4. Review</b> — see what was found and exactly what will happen, then <i>Tidy up now</i>.</td>
+</tr>
+<tr>
+<td><img src="assets/showcase/05-dashboard.png" alt="Dashboard"><br><b>Dashboard</b> — what can be freed, the disk forecast and one <i>Fix everything</i> button.</td>
+<td><img src="assets/showcase/06-projects-ai.png" alt="Projects with AI scores"><br><b>Projects</b> — every leftover <code>target/</code> with size, age and the AI's chance you'll build it again.</td>
+</tr>
+<tr>
+<td><img src="assets/showcase/08-insights-th.png" alt="Insights in Thai"><br><b>Insights (ไทย)</b> — forecast, what you won't reuse, unusual growth and model accuracy.</td>
+<td><img src="assets/showcase/07-settings.png" alt="Settings"><br><b>Settings</b> — language, Smart mode, folders and hard limits that always apply.</td>
+</tr>
+</table>
+
+<sub>Screenshots use a demo setup; your numbers will differ.</sub>
+
+## Use cases
+
+| Situation | What rtidy does for you |
+|---|---|
+| **Laptop with a small SSD** (256–512 GB) that keeps filling up | Forecasts *"disk full in ~N days"*, cleans harder as space runs out, and keeps the shared folder under a cap you choose. |
+| **Lots of small projects** — tutorials, Advent of Code, experiments, cloned examples | Stops creating a new `target/` in each one; common crates like `serde`, `tokio` or `syn` compile once and are shared by all. |
+| **Open-source contributor** juggling many repos and branches | Projects you've moved on from are removed first (the model learns which ones you return to); mark active ones *Keep* to protect them. |
+| **Game / graphics dev** (Bevy, wgpu, egui) with multi-GB debug builds | Lean builds drop dependency debug info, and anomaly alerts flag a sudden jump such as a new release build or toolchain. |
+| **Workstation where builds must never slow down** | Smart schedule learns when you never build and runs the clean-up then; anything used in the last day or two is never touched. |
+| **Classroom, bootcamp or team machines** | Installer plus a 4-step wizard: anyone can set it up in a minute, in English or Thai, with no terminal needed. |
+| **Terminal-only / servers / CI runners** | `rtidy fix` sets everything up in one command; `rtidy auto` runs on a schedule; `rtidy insights` prints the analysis. |
 
 ## Smart mode (on-device AI)
 

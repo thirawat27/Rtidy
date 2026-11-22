@@ -1048,7 +1048,12 @@ fn lang_switch(ui: &mut egui::Ui, current: Lang) -> Option<Lang> {
     Frame::new().fill(CARD_HI).corner_radius(10).inner_margin(Margin::same(3)).show(ui, |ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         ui.horizontal(|ui| {
-            for (l, name) in [(Lang::En, "EN"), (Lang::Th, "ไทย")] {
+            // inside right-aligned headers egui lays out right-to-left: keep EN | ไทย order
+            let mut items = [(Lang::En, "EN"), (Lang::Th, "ไทย")];
+            if ui.layout().prefer_right_to_left() {
+                items.reverse();
+            }
+            for (l, name) in items {
                 let sel = l == current;
                 let b = egui::Button::new(RichText::new(name).size(13.0).color(if sel { Color32::WHITE } else { MUTED }))
                     .fill(if sel { ACCENT } else { Color32::TRANSPARENT })
