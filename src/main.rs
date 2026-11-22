@@ -9,11 +9,13 @@
 // CLI output is re-attached to the parent terminal in `attach_console`.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod brain;
 mod cache;
 mod config;
 mod doctor;
 mod engine;
 mod gui;
+mod i18n;
 mod integrate;
 mod schedule;
 mod shared;
@@ -44,6 +46,8 @@ enum Cmd {
     },
     /// Open the app (same as running with no arguments)
     Gui,
+    /// AI insights: disk forecast, what you won't reuse, unusual growth, quiet hours
+    Insights,
     /// Health check: where the space went and what to do about it
     Doctor { roots: Vec<PathBuf> },
     /// List per-project target/ dirs with size and last build time
@@ -192,6 +196,7 @@ fn attach_console() {
 
 fn main() -> Result<()> {
     let cli = Cli::parse_from(wild_args());
+    i18n::set(Config::load().lang);
     let cmd = match cli.cmd {
         None | Some(Cmd::Gui) => {
             gui::run().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -218,6 +223,25 @@ fn main() -> Result<()> {
             println!("project folders: {}", folders.join(", "));
             engine::fix_all(&cfg)?;
             println!("\nsettings saved to {}", Config::path()?.display());
+            Ok(())
+        }
+        Cmd::Insights => {
+            let mut cfg = Config::load();
+            cfg.smart = true;
+            let s = engine::snapshot(&cfg);
+            for i in &s.insights {
+                let tag = match i.level {
+                    brain::Level::Good => "[ok]  ",
+                    brain::Level::Info => "[ai]  ",
+                    brain::Level::Warn => "[warn]",
+                };
+                println!("{tag} {}\n       {}", i.title, i.detail);
+            }
+            for r in s.targets.iter().filter(|r| !r.keep) {
+                if let Some(p) = r.reuse {
+                    println!("{:>5.0}%  {:>10}  {}", p * 100.0, human(r.size), r.path.display());
+                }
+            }
             Ok(())
         }
         Cmd::Doctor { roots } => {

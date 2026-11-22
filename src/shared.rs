@@ -117,6 +117,62 @@ pub fn profiles(shared: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// AI-guided shrink: evict the build units the model thinks you won't reuse, stricter
+/// (and with a lower size cap) as disk pressure rises. Hard limits still apply.
+pub fn smart_gc(cfg: &crate::config::Config, b: &crate::brain::Brain, now: i64, dry_run: bool) -> Result<u64> {
+    let Some(shared) = shared_target_dir()? else {
+        say!("gc: no shared target dir (run `rtidy setup`), skipping");
+        return Ok(0);
+    };
+    if !shared.is_dir() {
+        return Ok(0);
+    }
+    let mut freed = 0;
+    for p in profiles(&shared) {
+        let inc = p.join("incremental");
+        if inc.is_dir() {
+            freed += remove(&inc, dry_run);
+        }
+    }
+    let free = free_space(&shared);
+    let pressure = b.pressure(free);
+    let (tau, _, mult) = crate::brain::policy(pressure);
+    let cap = cfg.max_size().map(|c| (c as f64 * mult) as u64);
+    let min_age = if pressure >= 2 { 1.0 } else { 2.0 };
+    let hard_age = (cfg.gc_days as f64) * 2.0;
+
+    let groups = crate::brain::scan_artifacts(&shared);
+    let mut scored: Vec<(f64, &crate::brain::Group)> = groups.iter().map(|g| (b.artifact_reuse(g, now), g)).collect();
+    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut current: u64 = groups.iter().map(|g| g.size).sum();
+    let mut units = 0;
+    for (p, g) in scored {
+        let age = ((now - g.last_use) as f64 / 86_400.0).max(0.0);
+        if age < min_age {
+            continue; // never touch what you used in the last day or two
+        }
+        let over = cap.is_some_and(|c| current > c);
+        if !(p < tau || over || age > hard_age) {
+            continue;
+        }
+        let mut got = 0;
+        for path in &g.paths {
+            got += remove(path, dry_run);
+        }
+        current = current.saturating_sub(got);
+        freed += got;
+        units += 1;
+    }
+    say!(
+        "ai gc: {} {} ({units} build units, pressure {pressure}, cut-off {:.0}%) in {}",
+        if dry_run { "would free" } else { "freed" },
+        human(freed),
+        tau * 100.0,
+        shared.display()
+    );
+    Ok(freed)
+}
+
 /// Shrink the shared dir:
 /// 1. drop incremental caches (pure speed-up data, usually the biggest part)
 /// 2. drop artifacts untouched for `days`

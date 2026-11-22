@@ -1,8 +1,10 @@
 <p align="center"><img src="assets/logo.png" width="96" alt="rtidy logo"></p>
 <h1 align="center">rtidy</h1>
-<p align="center">Keeps your Rust <code>target/</code> folders tidy — on Windows, macOS and Linux.</p>
+<p align="center">Keeps your Rust <code>target/</code> folders tidy — on Windows, macOS and Linux. English &amp; ไทย.</p>
 
 <p align="center"><img src="assets/screenshot-dashboard.png" width="720" alt="rtidy dashboard"></p>
+
+<p align="center"><img src="assets/screenshot-insights-th.png" width="720" alt="AI insights in Thai"></p>
 
 ## The problem
 
@@ -17,6 +19,22 @@ Shared dependencies get compiled again and again, and nothing ever cleans up.
 4. **Trims the shared folder** — drops incremental caches, artifacts unused for N days, and keeps it under a size cap.
 5. **Trims the cargo download cache** in `~/.cargo`.
 6. **Cleans itself every day** — Task Scheduler (Windows), launchd (macOS), systemd timer or cron (Linux). Missed runs catch up when the computer is back on.
+
+## Smart mode (on-device AI)
+
+A tiny machine-learning brain — no LLM, no GPU, no internet. It is a few hundred numbers in a JSON file, and each analysis takes milliseconds.
+
+- **Reuse prediction.** An online logistic-regression model scores every build unit in the shared folder, and every leftover project `target/`, by the chance you'll use it again within 14 days. Inputs are how recently and how often it was used, how long it has existed, its size and recent git activity. Units you won't need go first; anything used in the last day or two is never touched.
+- **It learns from outcomes.** Every prediction is checked 14 days later. If rtidy removed something and you rebuilt it, the model learns it was wrong.
+- **Disk forecast.** Weighted regression over free-space history gives "disk full in ~N days". The cleaning threshold and the size cap tighten automatically as the disk fills up.
+- **Anomaly alerts.** A robust median/MAD test flags unusual growth, for example a new toolchain or a huge dependency.
+- **Smart schedule.** rtidy learns the hours you never build and moves the daily clean-up there.
+
+The **Insights** tab explains every decision. Hard limits from Settings still apply, and Smart mode can be switched off.
+
+## Language
+
+English and Thai (ไทย). rtidy picks your system language and you can switch anytime (EN | ไทย in the header or Settings). A Thai font (Noto Sans Thai, OFL) is bundled, so Thai renders on every OS.
 
 ## Install
 
@@ -48,6 +66,7 @@ rtidy fix ~/code     # or name them
 |---|---|
 | `rtidy` | Open the app |
 | `rtidy fix [folders]` | Everything in one go (saves settings) |
+| `rtidy insights` | AI insights: forecast, what you won't reuse, unusual growth |
 | `rtidy doctor [folders]` | Where the space went and how to fix it |
 | `rtidy scan [folders]` | List `target/` folders with size and age |
 | `rtidy clean [folders] --days 30 [--dry-run]` | Delete `target/` not built for N days |

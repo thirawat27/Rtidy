@@ -24,6 +24,12 @@ pub struct Config {
     pub auto_enabled: bool,
     /// HH:MM
     pub auto_at: String,
+    /// UI language
+    pub lang: crate::i18n::Lang,
+    /// AI: learn reuse patterns and disk trends to decide what to clean
+    pub smart: bool,
+    /// AI: move the daily clean-up to the hour you build least
+    pub smart_schedule: bool,
 }
 
 impl Default for Config {
@@ -37,6 +43,9 @@ impl Default for Config {
             lean: true,
             auto_enabled: true,
             auto_at: "12:30".into(),
+            lang: crate::i18n::detect(),
+            smart: true,
+            smart_schedule: true,
         }
     }
 }
