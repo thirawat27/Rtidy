@@ -20,7 +20,7 @@ Shared dependencies get compiled again and again, and nothing ever cleans up.
 
 ## Install
 
-Download from **Releases**:
+Build from source (see below), or download installers from **Actions → build → Artifacts**:
 
 | OS | File |
 |---|---|
