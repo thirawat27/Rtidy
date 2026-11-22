@@ -72,6 +72,13 @@ fn skip_dir(name: &str) -> bool {
 pub struct TreeScan {
     /// Cargo `target/` directories.
     pub targets: Vec<PathBuf>,
+    /// Directories holding a `Cargo.toml`.
+    ///
+    /// The model used to learn about projects only from leftover `target/` folders,
+    /// so the moment rtidy did its job and removed them it had nothing left to watch
+    /// and never learned anything. Noticing the manifest as the walk passes it costs
+    /// no extra syscall and keeps every project visible.
+    pub projects: Vec<PathBuf>,
     /// Project-local `.cargo/config.toml` files that set their own `build.target-dir`.
     pub overrides: Vec<PathBuf>,
     /// Directories actually walked, for the prune cache and for reporting.
@@ -83,15 +90,19 @@ pub struct TreeScan {
 impl TreeScan {
     fn merge(mut self, other: Self) -> Self {
         self.targets.extend(other.targets);
+        self.projects.extend(other.projects);
         self.overrides.extend(other.overrides);
         self.visited += other.visited;
         self.skipped += other.skipped;
         self
     }
 
-    /// Nothing here that rtidy would ever act on.
+    /// Nothing here that rtidy would ever act on or want to watch.
+    ///
+    /// A folder holding a project counts as interesting even with no `target/` in it
+    /// yet: the model watches projects, and pruning them away would blind it again.
     fn is_empty_of_rust(&self) -> bool {
-        self.targets.is_empty() && self.overrides.is_empty()
+        self.targets.is_empty() && self.overrides.is_empty() && self.projects.is_empty()
     }
 }
 
@@ -102,10 +113,17 @@ fn walk_subtree(start: &Path) -> TreeScan {
     let mut it = WalkDir::new(start).follow_links(false).into_iter();
     while let Some(entry) = it.next() {
         let Ok(e) = entry else { continue };
+        let name = e.file_name().to_string_lossy();
         if !e.file_type().is_dir() {
+            // A manifest names its directory as a project. Seen in passing, so it
+            // costs nothing beyond the listing the walk already did.
+            if name == "Cargo.toml"
+                && let Some(parent) = e.path().parent()
+            {
+                out.projects.push(parent.to_path_buf());
+            }
             continue;
         }
-        let name = e.file_name().to_string_lossy();
         // A `.cargo` directory means its *parent* may pin its own target-dir.
         // Noticing it as we pass costs nothing — the walk already listed it — and
         // the config files are then read for just those few directories. Asking
@@ -152,6 +170,9 @@ fn split_units(start: &Path, depth: usize, units: &mut Vec<PathBuf>) -> TreeScan
         && let Some(p) = crate::shared::project_override(start)
     {
         here.overrides.push(p);
+    }
+    if start.join("Cargo.toml").is_file() {
+        here.projects.push(start.to_path_buf());
     }
     if is_cargo_target(start) {
         here.targets.push(start.to_path_buf());

@@ -8,6 +8,7 @@ use crate::util::{human, remove_known, LOG_LINES};
 use eframe::egui::{
     self, vec2, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Sense, Stroke, TextureHandle,
 };
+use std::path::Path;
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -393,18 +394,16 @@ impl App {
             let leftover = anim_bytes(&ctx, "leftover", s.leftover());
             let n_shown = anim_count(&ctx, "leftover_n", n as u64);
             stat(ui, w, t("Leftover targets"), &human(leftover), &tf("{} folders", &[&n_shown.to_string()]), n > 0);
-            stat(
-                ui,
-                w,
-                t("Shared target"),
-                &if s.shared.is_some() { human(anim_bytes(&ctx, "shared", s.shared_size)) } else { t("Off").into() },
-                &if s.shared.is_some() {
-                    tf("cap {} GB", &[&self.cfg.max_size_gb.to_string()])
-                } else {
-                    t("not set up").into()
-                },
-                s.shared.is_none(),
-            );
+            match &s.shared {
+                Some(dir) => stat_path(
+                    ui,
+                    w,
+                    t("Shared target"),
+                    &human(anim_bytes(&ctx, "shared", s.shared_size)),
+                    dir,
+                ),
+                None => stat(ui, w, t("Shared target"), t("Off"), t("not set up"), true),
+            }
             stat(ui, w, t("Cargo cache"), &human(anim_bytes(&ctx, "cache", s.cache_size)), t("~/.cargo downloads"), false);
             let sub = match s.days_to_full {
                 Some(d) if d < 60.0 => tf("full in ~{} days", &[&format!("{d:.0}")]),
@@ -1185,6 +1184,55 @@ fn stat(ui: &mut egui::Ui, w: f32, title: &str, value: &str, sub: &str, alert: b
             ui.label(RichText::new(sub).size(12.0).color(MUTED));
         });
     });
+}
+
+/// The shared-target card: like `stat`, but the folder's path is on it and clicking
+/// opens that folder.
+///
+/// The card used to show only a size, which left no way to find out *where* the
+/// shared folder actually is.
+fn stat_path(ui: &mut egui::Ui, w: f32, title: &str, value: &str, dir: &Path) {
+    card(CARD).show(ui, |ui| {
+        ui.set_width(w - 34.0);
+        ui.vertical(|ui| {
+            ui.label(RichText::new(title).size(12.5).color(MUTED));
+            ui.label(RichText::new(value).size(24.0).strong().color(TEXT));
+            let shown = crate::util::plain(dir);
+            let r = ui
+                .add(egui::Label::new(RichText::new(ellipsize(&shown, 34)).size(11.5).color(ACCENT)).sense(Sense::click()))
+                .on_hover_text(tf("{} — click to open", &[&shown]))
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if r.clicked() {
+                open_folder(dir);
+            }
+        });
+    });
+}
+
+/// Keep the middle of a long path, which is where the useful part usually is.
+fn ellipsize(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(1) / 2;
+    let head: String = s.chars().take(keep).collect();
+    let tail: String = s.chars().skip(n - keep).collect();
+    format!("{head}…{tail}")
+}
+
+/// Show a folder in the desktop's file manager.
+fn open_folder(dir: &Path) {
+    let plain = crate::util::plain(dir);
+    #[cfg(windows)]
+    let (cmd, args) = ("explorer", vec![plain]);
+    #[cfg(target_os = "macos")]
+    let (cmd, args) = ("open", vec![plain]);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let (cmd, args) = ("xdg-open", vec![plain]);
+    // explorer.exe reports a non-zero exit code even when it worked, so the result
+    // is deliberately not checked.
+    let _ = crate::util::quiet_cmd(cmd).args(args).spawn();
 }
 
 fn section(ui: &mut egui::Ui, title: &str, sub: &str) {

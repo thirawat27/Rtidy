@@ -127,47 +127,91 @@ pub fn scan_artifacts(shared: &Path) -> Vec<Group> {
     let mut groups: HashMap<String, Group> = HashMap::new();
     for prof in crate::shared::profiles(shared) {
         let pname = prof.strip_prefix(shared).unwrap_or(&prof).to_string_lossy().replace('\\', "/");
-        let fp: HashSet<String> = fs::read_dir(prof.join(".fingerprint"))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        for sub in [".fingerprint", "deps", "build"] {
-            for e in fs::read_dir(prof.join(sub)).into_iter().flatten().flatten() {
-                let file_name = e.file_name();
-                // Borrowed throughout: a shared dir holds tens of thousands of entries,
-                // and only the surviving group key needs to own its text.
-                let name = file_name.to_string_lossy();
-                let stem = name.split('.').next().unwrap_or(&name);
-                let unit = match stem.strip_prefix("lib") {
-                    Some(rest) if !fp.contains(stem) && fp.contains(rest) => rest,
-                    _ => stem,
-                };
-                let Ok(md) = e.metadata() else { continue };
-                let path = e.path();
-                let (size, last) = if md.is_dir() {
-                    let mut t = md.modified().map(unix).unwrap_or(0);
-                    for c in fs::read_dir(&path).into_iter().flatten().flatten() {
-                        if let Ok(cm) = c.metadata() {
-                            t = t.max(if cm.is_dir() { cm.modified().map(unix).unwrap_or(0) } else { used_time_file(&cm) });
-                        }
-                    }
-                    (dir_size(&path), t)
-                } else {
-                    (md.len(), used_time_file(&md))
-                };
-                let g = groups
-                    .entry(format!("{pname}/{unit}"))
-                    .or_insert_with(|| Group { key: String::new(), paths: vec![], size: 0, last_use: 0 });
-                g.paths.push((path, size));
-                g.size += size;
-                g.last_use = g.last_use.max(last);
-            }
-        }
+        scan_modern(&prof, &pname, &mut groups);
+        scan_legacy(&prof, &pname, &mut groups);
     }
     // The map key already is the group key: move it across instead of cloning per entry.
     groups.into_iter().map(|(key, g)| Group { key, ..g }).collect()
+}
+
+/// Add one measured path to its crate's group.
+fn add(groups: &mut HashMap<String, Group>, key: String, path: PathBuf, size: u64, last: i64) {
+    let g = groups
+        .entry(key)
+        .or_insert_with(|| Group { key: String::new(), paths: vec![], size: 0, last_use: 0 });
+    g.paths.push((path, size));
+    g.size += size;
+    g.last_use = g.last_use.max(last);
+}
+
+/// Cargo 1.100 and later: `<profile>/build/<crate>/<hash>/{out,fingerprint}`.
+///
+/// All of a crate's hash directories (one per feature set, plus the host build of a
+/// build script) are kept as a single unit: they are built and reused together, and
+/// grouping them keeps the model's keys stable across feature changes.
+fn scan_modern(prof: &Path, pname: &str, groups: &mut HashMap<String, Group>) {
+    for crate_dir in fs::read_dir(prof.join("build")).into_iter().flatten().flatten() {
+        let crate_name = crate_dir.file_name().to_string_lossy().into_owned();
+        let crate_path = crate_dir.path();
+        for unit in fs::read_dir(&crate_path).into_iter().flatten().flatten() {
+            let Ok(md) = unit.metadata() else { continue };
+            if !md.is_dir() {
+                continue;
+            }
+            let path = unit.path();
+            // Cargo rewrites `fingerprint/invoked.timestamp` every time it uses a
+            // unit, even when nothing needs rebuilding, which is exactly the "you
+            // reached for this again" signal the model wants.
+            let stamp = fs::metadata(path.join("fingerprint").join("invoked.timestamp"))
+                .ok()
+                .map(|m| used_time_file(&m))
+                .unwrap_or(0);
+            let last = stamp.max(md.modified().map(unix).unwrap_or(0));
+            add(groups, format!("{pname}/{crate_name}"), path.clone(), dir_size(&path), last);
+        }
+    }
+}
+
+/// Cargo 1.99 and earlier: `<profile>/{deps,.fingerprint,build}` holding flat entries.
+///
+/// Still read so a shared folder filled by an older toolchain is not stranded.
+fn scan_legacy(prof: &Path, pname: &str, groups: &mut HashMap<String, Group>) {
+    let fp: HashSet<String> = fs::read_dir(prof.join(".fingerprint"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    if fp.is_empty() && !prof.join("deps").is_dir() {
+        return; // nothing in the old layout here
+    }
+    for sub in [".fingerprint", "deps"] {
+        for e in fs::read_dir(prof.join(sub)).into_iter().flatten().flatten() {
+            let file_name = e.file_name();
+            // Borrowed throughout: a shared dir holds tens of thousands of entries,
+            // and only the surviving group key needs to own its text.
+            let name = file_name.to_string_lossy();
+            let stem = name.split('.').next().unwrap_or(&name);
+            let unit = match stem.strip_prefix("lib") {
+                Some(rest) if !fp.contains(stem) && fp.contains(rest) => rest,
+                _ => stem,
+            };
+            let Ok(md) = e.metadata() else { continue };
+            let path = e.path();
+            let (size, last) = if md.is_dir() {
+                let mut t = md.modified().map(unix).unwrap_or(0);
+                for c in fs::read_dir(&path).into_iter().flatten().flatten() {
+                    if let Ok(cm) = c.metadata() {
+                        t = t.max(if cm.is_dir() { cm.modified().map(unix).unwrap_or(0) } else { used_time_file(&cm) });
+                    }
+                }
+                (dir_size(&path), t)
+            } else {
+                (md.len(), used_time_file(&md))
+            };
+            add(groups, format!("{pname}/{unit}"), path, size, last);
+        }
+    }
 }
 
 /// Days since the project's git repo last changed (commit, checkout, staging).
@@ -410,7 +454,7 @@ pub enum Insight {
     UnlikelyProjects { count: usize, bytes: u64, examples: String },
     GrowthSpike { latest: u64, typical: u64 },
     QuietHour { hour: u32, already_scheduled: bool },
-    ModelLearning { learned: u64 },
+    ModelLearning { learned: u64, projects: usize, units: usize },
     ModelAccuracy { learned: u64, accuracy: f64 },
 }
 
@@ -479,7 +523,14 @@ impl Insight {
                 t("Smart schedule moves the daily clean-up there.")
             }
             .into(),
-            Self::ModelLearning { learned } | Self::ModelAccuracy { learned, .. } => tf(
+            // While the count is still zero, say what is being watched instead: a
+            // bare "0 outcomes" reads as broken, when in fact the model is tracking
+            // everything and simply has not seen a rebuild come back yet.
+            Self::ModelLearning { learned, projects, units } => tf(
+                "Watching {} projects and {} build units. {} outcomes so far — it learns when you rebuild something it expected you to drop. Runs on this computer only; nothing is uploaded.",
+                &[&projects.to_string(), &units.to_string(), &learned.to_string()],
+            ),
+            Self::ModelAccuracy { learned, .. } => tf(
                 "{} outcomes learned. Runs on this computer only; nothing is uploaded.",
                 &[&learned.to_string()],
             ),
@@ -559,7 +610,11 @@ pub fn analyze(
 
     let (learned, accuracy) = brain.accuracy();
     out.push(if learned < 30 {
-        Insight::ModelLearning { learned }
+        Insight::ModelLearning {
+            learned,
+            projects: brain.projects.len(),
+            units: brain.artifacts.len(),
+        }
     } else {
         Insight::ModelAccuracy { learned, accuracy }
     });

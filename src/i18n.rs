@@ -200,6 +200,8 @@ const TH: &[(&str, &str)] = &[
     ("Where are your projects?", "โปรเจกต์ของคุณอยู่ที่ไหน?"),
     ("Where rtidy looks for Rust projects", "ที่ที่ rtidy จะค้นหาโปรเจกต์ Rust"),
     ("You can turn on daily clean-up later from the dashboard.", "เปิดการล้างรายวันทีหลังได้จากแดชบอร์ด"),
+    ("{} — click to open", "{} — คลิกเพื่อเปิดโฟลเดอร์"),
+    ("Watching {} projects and {} build units. {} outcomes so far — it learns when you rebuild something it expected you to drop. Runs on this computer only; nothing is uploaded.", "กำลังเฝ้าดู {} โปรเจกต์ และ {} build unit เรียนรู้แล้ว {} ผลลัพธ์ — โมเดลจะเรียนรู้เมื่อคุณ build สิ่งที่มันคิดว่าคุณจะทิ้งแล้ว ประมวลผลในเครื่องนี้เท่านั้น ไม่มีการส่งข้อมูลออก"),
     ("You rarely build around {}:00", "คุณแทบไม่ build ช่วง {}:00"),
     ("You're all set", "พร้อมแล้ว"),
     ("Your next build of each project will take a little longer once; after that it's faster.", "build ครั้งถัดไปของแต่ละโปรเจกต์จะนานขึ้นนิดหน่อยแค่ครั้งเดียว หลังจากนั้นจะเร็วขึ้น"),
@@ -250,14 +252,22 @@ mod tests {
         let map = &*THAI;
         let mut missing = Vec::new();
         for src in sources {
-            for prefix in ["t(\"", "tf(\""] {
+            for prefix in ["t(", "tf("] {
                 for (i, _) in src.match_indices(prefix) {
                     // skip identifiers ending in t/tf (e.g. "set(", "left(")
                     let before = src[..i].chars().last().unwrap_or(' ');
                     if before.is_alphanumeric() || before == '_' {
                         continue;
                     }
+                    // A long call is often wrapped, putting the literal on the next
+                    // line: `tf(\n    "…"`. Matching only `tf("` quietly skipped
+                    // those, so a wrapped string could ship with no translation.
                     let rest = &src[i + prefix.len()..];
+                    let Some(open) = rest.find(|c: char| !c.is_whitespace()) else { continue };
+                    if rest.as_bytes()[open] != b'"' {
+                        continue; // not a literal: `t(name)`, `tf(x, …)`
+                    }
+                    let rest = &rest[open + 1..];
                     let end = rest.find('"').unwrap();
                     let key = &rest[..end];
                     match map.get(key) {

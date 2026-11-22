@@ -40,8 +40,14 @@ struct Note {
     dirs: u32,
 }
 
+/// Bumped whenever "holds nothing rtidy cares about" starts meaning something
+/// different. Notes written under an older meaning are dropped rather than trusted.
+const FORMAT: u32 = 2;
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct Prune {
+    #[serde(default)]
+    version: u32,
     /// Folder path → what the last walk of it found.
     empty: HashMap<String, Note>,
 }
@@ -64,13 +70,15 @@ impl Prune {
     }
 
     pub fn load() -> Self {
-        Self::path()
+        let saved: Self = Self::path()
             .and_then(|p| fs::read_to_string(p).ok())
             .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if saved.version == FORMAT { saved } else { Self { version: FORMAT, ..Default::default() } }
     }
 
-    pub fn save(&self) -> std::io::Result<()> {
+    pub fn save(&mut self) -> std::io::Result<()> {
+        self.version = FORMAT;
         let Some(p) = Self::path() else { return Ok(()) };
         if let Some(parent) = p.parent() {
             fs::create_dir_all(parent)?;

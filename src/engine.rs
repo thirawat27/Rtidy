@@ -73,19 +73,57 @@ impl Snapshot {
     }
 }
 
-fn project_key(target: &Path) -> String {
-    target.parent().unwrap_or(target).display().to_string()
+/// The key a project is known by: its directory.
+fn project_key(dir: &Path) -> String {
+    dir.display().to_string()
 }
 
-fn project_obs(ts: &[targets::Target], now: i64) -> Vec<ProjectObs> {
-    ts.iter()
-        .map(|t| ProjectObs {
-            key: project_key(&t.path),
-            last_build: brain::unix(t.last_build),
-            size: t.size,
-            git_days: brain::git_days(t.path.parent().unwrap_or(&t.path), now),
-        })
-        .collect()
+/// The observation for the project a target dir belongs to.
+///
+/// Observations are per project now, and a project need not have a target dir, so
+/// the two lists cannot be walked side by side any more.
+fn obs_for<'a>(obs: &'a [ProjectObs], target: &Path) -> Option<&'a ProjectObs> {
+    let dir = target.parent()?;
+    let key = project_key(dir);
+    obs.iter().find(|o| o.key == key)
+}
+
+/// What the model gets to see about each project.
+///
+/// Every directory holding a `Cargo.toml` is reported, whether or not it still has a
+/// `target/` beside it. Deriving this from leftover target dirs alone meant that once
+/// rtidy had done its job there was nothing left to observe, and the model stayed at
+/// zero outcomes forever.
+fn project_obs(projects: &[PathBuf], ts: &[targets::Target], now: i64) -> Vec<ProjectObs> {
+    // Size and last build come from the project's own target dir when one survives.
+    let by_dir: std::collections::HashMap<&Path, &targets::Target> =
+        ts.iter().filter_map(|t| t.path.parent().map(|d| (d, t))).collect();
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for dir in projects {
+        let key = project_key(dir);
+        if !seen.insert(key.clone()) {
+            continue; // a workspace can list the same directory twice
+        }
+        let found = by_dir.get(dir.as_path());
+        let git_days = brain::git_days(dir, now);
+        // With no target dir left, the manifest's own timestamp is the best stand-in
+        // for "when was this last worked on"; `git_days` carries the rest.
+        let last_build = found.map(|t| brain::unix(t.last_build)).unwrap_or_else(|| {
+            std::fs::metadata(dir.join("Cargo.toml"))
+                .and_then(|m| m.modified())
+                .map(brain::unix)
+                .unwrap_or(0)
+        });
+        out.push(ProjectObs {
+            key,
+            last_build,
+            size: found.map(|t| t.size).unwrap_or(0),
+            git_days,
+        });
+    }
+    out
 }
 
 pub fn snapshot(cfg: &Config) -> Snapshot {
@@ -96,13 +134,14 @@ pub fn snapshot(cfg: &Config) -> Snapshot {
     // Five independent scans over different parts of the disk, one of them a
     // subprocess (`schtasks` on Windows). Run together, the dashboard waits for the
     // slowest instead of for their sum.
-    let (found, overrides, (shared_size, shared_incremental), cache_size, toolchains, scheduled, groups) =
+    #[allow(clippy::type_complexity)]
+    let (found, overrides, project_dirs, (shared_size, shared_incremental), cache_size, toolchains, scheduled, groups) =
         std::thread::scope(|s| {
             // One pass over the project tree yields both the target dirs and the
             // per-project target-dir overrides.
             let projects = s.spawn(|| {
                 let scan = targets::scan_tree(roots);
-                (targets::size_targets(scan.targets), scan.overrides)
+                (targets::size_targets(scan.targets), scan.overrides, scan.projects)
             });
             let shared_sizes = s.spawn(|| match &shared {
                 Some(d) => {
@@ -124,10 +163,11 @@ pub fn snapshot(cfg: &Config) -> Snapshot {
                 _ => Vec::new(),
             });
 
-            let (found, overrides) = projects.join().unwrap_or_default();
+            let (found, overrides, project_dirs) = projects.join().unwrap_or_default();
             (
                 found,
                 overrides,
+                project_dirs,
                 shared_sizes.join().unwrap_or((0, 0)),
                 cache.join().unwrap_or(0),
                 tcs.join().unwrap_or_default(),
@@ -136,7 +176,7 @@ pub fn snapshot(cfg: &Config) -> Snapshot {
             )
         });
 
-    let obs = project_obs(&found, now);
+    let obs = project_obs(&project_dirs, &found, now);
     let lean = read_cargo_config().map(|(_, _, d)| shared::is_lean(&d)).unwrap_or(false);
     let free = roots.first().and_then(|r| free_space(r)).or_else(|| dirs::home_dir().and_then(|h| free_space(&h)));
     // Only the tail matters, and the log outlives many runs.
@@ -174,7 +214,8 @@ pub fn snapshot(cfg: &Config) -> Snapshot {
         b.observe(now, &obs, &groups, free, shared_size);
         let _ = b.save();
         let mut rows = Vec::new();
-        for (row, o) in snap.targets.iter_mut().zip(&obs) {
+        for row in snap.targets.iter_mut() {
+            let Some(o) = obs_for(&obs, &row.path) else { continue };
             let p = b.project_reuse(&o.key, o.last_build, o.size, o.git_days, now);
             row.reuse = Some(p);
             if !row.keep {
@@ -218,10 +259,13 @@ pub fn fix_all(cfg: &Config) -> Result<FixReport> {
     let mut b = cfg.smart.then(Brain::load);
     // One scan feeds both the model and the clean-up; it used to be walked and sized
     // twice whenever smart mode was on.
-    let found = targets::find_targets(&cfg.roots);
+    let scan = targets::scan_tree(&cfg.roots);
+    let project_dirs = scan.projects;
+    let found = targets::size_targets(scan.targets);
     if let Some(b) = b.as_mut() {
-        // record leftovers before they go, so the model knows these projects
-        b.observe(now, &project_obs(&found, now), &[], None, 0);
+        // Record the projects before their leftovers go, so the model keeps knowing
+        // about them once the target dirs are gone.
+        b.observe(now, &project_obs(&project_dirs, &found, now), &[], None, 0);
     }
     // With a shared dir, per-project target/ folders are dead weight: remove them all
     // (projects marked with .rtidy-keep are left alone).
@@ -260,8 +304,10 @@ pub fn auto_from_config(cfg: &Config) -> Result<u64> {
 
     let now = brain::now();
     let mut b = Brain::load();
-    let found = targets::find_targets(&cfg.roots);
-    let obs = project_obs(&found, now);
+    let scan = targets::scan_tree(&cfg.roots);
+    let project_dirs = scan.projects;
+    let found = targets::size_targets(scan.targets);
+    let obs = project_obs(&project_dirs, &found, now);
     let shared_dir = shared::shared_target_dir()?;
     let groups = shared_dir.as_deref().map(brain::scan_artifacts).unwrap_or_default();
     let free = cfg.roots.first().and_then(|r| free_space(r));
@@ -273,10 +319,11 @@ pub fn auto_from_config(cfg: &Config) -> Result<u64> {
 
     // leftover project targets: remove the ones the model says won't come back
     let mut freed = 0;
-    for (t, o) in found.iter().zip(&obs) {
+    for t in found.iter() {
         if t.keep {
             continue;
         }
+        let Some(o) = obs_for(&obs, &t.path) else { continue };
         let age = age_days(t.last_build);
         let p = b.project_reuse(&o.key, o.last_build, o.size, o.git_days, now);
         if age >= 3 && (p < tau_p || age >= cfg.days * 2) {

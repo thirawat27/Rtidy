@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+
 
 /// A project-local `.cargo/config.toml` that sets its own target-dir bypasses the
 /// shared dir. One definition, used by both the dashboard and `rtidy doctor`.
@@ -138,6 +138,25 @@ fn set_lean(doc: &mut toml_edit::DocumentMut) {
 }
 
 /// Profile dirs like <shared>/debug, <shared>/release, <shared>/<triple>/debug.
+/// Does this directory look like a Cargo profile directory?
+///
+/// Cargo 1.100 reorganised the target directory. Build units used to sit in
+/// `<profile>/deps` with their fingerprints in `<profile>/.fingerprint`; they now sit
+/// in `<profile>/build/<crate>/<hash>/` with `out/` and `fingerprint/` inside. rtidy
+/// recognises both, so it keeps working on older toolchains and on directories left
+/// behind by them.
+///
+/// Missing the new layout is not a cosmetic problem: `profiles` feeds the garbage
+/// collector, the incremental-cache sweep and the model's view of what you rebuild,
+/// so when it found nothing the shared folder was never shrunk and the model never
+/// saw a single build unit.
+pub fn is_profile_dir(p: &Path) -> bool {
+    p.join("build").is_dir()            // cargo >= 1.100 (and build scripts before it)
+        || p.join("deps").is_dir()      // cargo <= 1.99
+        || p.join(".fingerprint").is_dir()
+        || p.join("incremental").is_dir()
+}
+
 pub fn profiles(shared: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for e in fs::read_dir(shared).into_iter().flatten().flatten() {
@@ -145,12 +164,15 @@ pub fn profiles(shared: &Path) -> Vec<PathBuf> {
         if !p.is_dir() {
             continue;
         }
-        if p.join("deps").is_dir() || p.join(".fingerprint").is_dir() {
+        if is_profile_dir(&p) {
             out.push(p);
         } else {
+            // A cross-compilation target puts the profiles one level down:
+            // `<shared>/<triple>/debug`.
             for sub in fs::read_dir(&p).into_iter().flatten().flatten() {
-                if sub.path().join("deps").is_dir() {
-                    out.push(sub.path());
+                let s = sub.path();
+                if s.is_dir() && is_profile_dir(&s) {
+                    out.push(s);
                 }
             }
         }
@@ -235,31 +257,23 @@ pub fn gc(days: u64, max_size: Option<u64>, dry_run: bool) -> Result<u64> {
         }
     }
 
-    // One directory read yields each entry's mtime and, for plain files, its size --
-    // no extra stat, and no second walk at delete time.
-    let mut entries: Vec<(SystemTime, PathBuf, Option<u64>)> = Vec::new();
-    for p in &profs {
-        for sub in ["deps", "build", ".fingerprint"] {
-            for e in fs::read_dir(p.join(sub)).into_iter().flatten().flatten() {
-                let Ok(md) = e.metadata() else { continue };
-                let size = md.is_file().then_some(md.len());
-                entries.push((md.modified().unwrap_or(SystemTime::UNIX_EPOCH), e.path(), size));
-            }
-        }
-    }
-    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    // The same build units the model sees, so both the old and the new Cargo layout
+    // are understood in one place, and each unit's size and last-use time are already
+    // measured -- no second walk at delete time.
+    let mut units = crate::brain::scan_artifacts(&shared);
+    units.sort_unstable_by_key(|g| g.last_use); // oldest first
 
-    let cutoff = SystemTime::now() - Duration::from_secs(days * 86_400);
+    let cutoff = crate::brain::now() - (days * 86_400) as i64;
     let mut current = dir_size(&shared).saturating_sub(if dry_run { freed } else { 0 });
-    for (t, path, size) in entries {
+    for g in units {
         let over = max_size.is_some_and(|m| current > m);
-        if t >= cutoff && !over {
+        if g.last_use >= cutoff && !over {
             break; // sorted oldest-first: nothing older remains
         }
-        let got = match size {
-            Some(s) => remove_known(&path, s, dry_run),
-            None => remove(&path, dry_run), // a directory: its size still needs a walk
-        };
+        let mut got = 0;
+        for (path, size) in &g.paths {
+            got += remove_known(path, *size, dry_run);
+        }
         current = current.saturating_sub(got);
         freed += got;
     }
