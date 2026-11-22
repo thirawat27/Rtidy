@@ -4,12 +4,12 @@ use crate::brain::Level;
 use crate::config::Config;
 use crate::engine::{self, Snapshot};
 use crate::i18n::{self, t, tf, Lang};
-use crate::util::{human, remove, LOG_LINES};
+use crate::util::{human, remove_known, LOG_LINES};
 use eframe::egui::{
     self, vec2, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Sense, Stroke, TextureHandle,
 };
 use std::sync::mpsc::{channel, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 const LOGO_PNG: &[u8] = include_bytes!("../assets/logo.png");
@@ -45,6 +45,8 @@ pub fn run() -> eframe::Result {
 enum Msg {
     Snapshot(Box<Snapshot>),
     Done(String, bool),
+    /// Folders found by searching the computer (see `crate::discover`).
+    Found(Vec<std::path::PathBuf>),
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -76,6 +78,10 @@ struct App {
 struct Wizard {
     step: usize,
     integrate: bool,
+    /// The Folders step searches the computer by itself the first time it is shown
+    /// with nothing to offer; this keeps it to one attempt, so a machine with no Rust
+    /// on it does not re-scan on every repaint.
+    searched: bool,
 }
 
 const STEPS: [&str; 5] = ["Welcome", "Folders", "Preferences", "Review", "Done"];
@@ -100,7 +106,7 @@ impl App {
             toast: None,
             logo,
             first_run,
-            wizard: first_run.then(|| Wizard { step: 0, integrate: !crate::integrate::is_integrated() }),
+            wizard: first_run.then(|| Wizard { step: 0, integrate: !crate::integrate::is_integrated(), searched: false }),
             last_done: None,
             last_ok: true,
             add_path: String::new(),
@@ -123,6 +129,16 @@ impl App {
         });
         self.rx = Some(rx);
         self.busy = Some(label.to_string());
+    }
+
+    /// Search the whole computer for Rust projects, off the UI thread.
+    ///
+    /// Bounded to a few seconds so a huge or slow filesystem can never hang the app;
+    /// whatever has been found by then is what comes back.
+    fn search_computer(&mut self, ctx: &egui::Context) {
+        self.spawn(ctx, t("Searching this computer…"), |_cfg| {
+            Msg::Found(crate::discover::discover_roots(Duration::from_secs(20)))
+        });
     }
 
     fn refresh(&mut self, ctx: &egui::Context) {
@@ -155,6 +171,22 @@ impl App {
                 self.busy = None;
                 self.rx = None;
             }
+            Ok(Msg::Found(found)) => {
+                let before = self.cfg.roots.len();
+                for f in found {
+                    if !self.cfg.roots.contains(&f) {
+                        self.cfg.roots.push(f);
+                    }
+                }
+                let added = self.cfg.roots.len() - before;
+                self.toast(match added {
+                    0 => t("No new project folders found").to_string(),
+                    1 => t("Added 1 project folder").to_string(),
+                    n => tf("Added {} project folders", &[&n.to_string()]),
+                });
+                self.busy = None;
+                self.rx = None;
+            }
             Ok(Msg::Done(text, ok)) => {
                 self.last_ok = ok;
                 self.last_done = Some(text.clone());
@@ -184,57 +216,62 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll(ctx);
+    // egui 0.34 turned `App::update(&Context)` into `App::ui(&mut Ui)`: panels are now
+    // nested inside a root `Ui` with `show_inside` rather than attached to the context.
+    // The `Context` is still needed for repaint requests and the toast overlay, and is
+    // an `Arc` handle, so cloning it once per frame is free.
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.poll(&ctx);
         if self.busy.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
         if self.wizard.is_some() {
             let step = self.wizard.as_ref().map_or(0, |w| w.step);
-            egui::TopBottomPanel::bottom("wiz_nav")
+            egui::Panel::bottom("wiz_nav")
                 .frame(Frame::new().fill(BG).inner_margin(Margin { left: 28, right: 28, top: 12, bottom: 24 }))
                 .show_separator_line(false)
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.set_max_width(ui.available_width().min(760.0));
-                        self.w_nav(ui, ctx, step);
+                        self.w_nav(ui, &ctx, step);
                     });
                 });
             egui::CentralPanel::default()
                 .frame(Frame::new().fill(BG).inner_margin(Margin::same(28)))
-                .show(ctx, |ui| self.wizard_ui(ui));
-            self.draw_toast(ctx);
+                .show(ui, |ui| self.wizard_ui(ui, &ctx));
+            self.draw_toast(&ctx);
             return;
         }
 
-        egui::TopBottomPanel::top("top")
+        egui::Panel::top("top")
             .frame(Frame::new().fill(BG).inner_margin(Margin { left: 24, right: 24, top: 18, bottom: 8 }))
             .show_separator_line(false)
-            .show(ctx, |ui| self.header(ui, ctx));
+            .show(ui, |ui| self.header(ui, &ctx));
 
         egui::CentralPanel::default()
             .frame(Frame::new().fill(BG).inner_margin(Margin { left: 24, right: 24, top: 8, bottom: 16 }))
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                    self.hero(ui, ctx);
+                    self.hero(ui, &ctx);
                     ui.add_space(14.0);
                     self.stats(ui);
                     ui.add_space(14.0);
-                    self.automation(ui, ctx);
+                    self.automation(ui, &ctx);
                     ui.add_space(18.0);
                     self.tabs(ui);
                     ui.add_space(10.0);
                     match self.tab {
                         Tab::Insights => self.insights(ui),
-                        Tab::Projects => self.projects(ui, ctx),
-                        Tab::Settings => self.settings(ui, ctx),
+                        Tab::Projects => self.projects(ui, &ctx),
+                        Tab::Settings => self.settings(ui, &ctx),
                         Tab::Activity => self.activity(ui),
                     }
                 });
             });
 
-        self.draw_toast(ctx);
+        self.draw_toast(&ctx);
     }
 }
 
@@ -250,13 +287,23 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("rtidy").size(22.0).strong().color(TEXT));
                     if self.cfg.smart {
-                        chip(ui, t("✨ Smart mode"), AI);
+                        chip_icon(ui, Icon::Sparkle, t("Smart mode"), AI);
                     }
                 });
                 ui.label(RichText::new(t("Keeps your Rust target folders tidy")).size(13.0).color(MUTED));
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let r = ui.add_enabled(self.busy.is_none(), ghost_button(t("⟳  Rescan")));
+                let r = icon_button(
+                    ui,
+                    self.busy.is_none(),
+                    Icon::Refresh,
+                    t("Rescan"),
+                    14.0,
+                    Color32::TRANSPARENT,
+                    LINE,
+                    if self.busy.is_none() { TEXT } else { MUTED },
+                    vec2(0.0, 32.0),
+                );
                 if r.clicked() {
                     self.refresh(ctx);
                 }
@@ -281,27 +328,30 @@ impl App {
                                 ui.label(RichText::new(label).size(20.0).color(TEXT));
                             });
                             ui.label(RichText::new(t("This can take a moment on big folders.")).color(MUTED));
+                            ui.add_space(10.0);
+                            sweep_bar(ui, ui.available_width().min(360.0));
                         }
                         (None, Some(s)) => {
                             let issues = s.issues();
                             if issues.is_empty() {
-                                ui.label(RichText::new(t("All tidy ✔")).size(26.0).strong().color(GOOD));
+                                icon_label(ui, Icon::Check, 24.0, GOOD, RichText::new(t("All tidy")).size(26.0).strong().color(GOOD));
                                 ui.label(
                                     RichText::new(t("Shared target folder, lean builds and daily clean-up are all on."))
                                         .color(MUTED),
                                 );
                             } else {
                                 ui.label(RichText::new(t("Up to")).color(MUTED));
-                                ui.label(RichText::new(human(s.reclaimable())).size(40.0).strong().color(TEXT));
+                                let shown = anim_bytes(ctx, "reclaimable", s.reclaimable());
+                                ui.label(RichText::new(human(shown)).size(40.0).strong().color(TEXT));
                                 ui.label(RichText::new(t("can be freed")).color(MUTED));
                                 ui.add_space(8.0);
                                 for i in issues.iter().take(4) {
                                     ui.label(RichText::new(format!("•  {i}")).color(WARN));
                                 }
                             }
-                            if let Some(w) = s.insights.iter().find(|i| i.level == Level::Warn) {
+                            if let Some(w) = s.insights.iter().find(|i| i.level() == Level::Warn) {
                                 ui.add_space(4.0);
-                                ui.label(RichText::new(format!("✨  {}", w.title)).color(AI));
+                                icon_label(ui, Icon::Sparkle, 15.0, AI, RichText::new(w.title()).color(AI));
                             }
                         }
                         (None, None) => {}
@@ -309,14 +359,19 @@ impl App {
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let enabled = self.busy.is_none() && !self.cfg.roots.is_empty();
-                    let btn = egui::Button::new(RichText::new(t("✨  Fix everything")).size(18.0).strong().color(Color32::WHITE))
-                        .fill(if enabled { ACCENT } else { ACCENT_DIM })
-                        .corner_radius(14)
-                        .min_size(vec2(220.0, 56.0));
-                    if ui
-                        .add_enabled(enabled, btn)
-                        .on_hover_text(t("Share one target folder across projects, build dependencies lean, delete leftover target/ folders, trim caches and turn on daily clean-up."))
-                        .clicked()
+                    if icon_button(
+                        ui,
+                        enabled,
+                        Icon::Sparkle,
+                        t("Fix everything"),
+                        18.0,
+                        if enabled { ACCENT } else { ACCENT_DIM },
+                        Color32::TRANSPARENT,
+                        Color32::WHITE,
+                        vec2(220.0, 56.0),
+                    )
+                    .on_hover_text(t("Share one target folder across projects, build dependencies lean, delete leftover target/ folders, trim caches and turn on daily clean-up."))
+                    .clicked()
                     {
                         self.fix_all(ctx);
                     }
@@ -326,17 +381,23 @@ impl App {
     }
 
     fn stats(&self, ui: &mut egui::Ui) {
-        let s = self.snap.clone().unwrap_or_default();
+        // One shared empty snapshot stands in until the first scan lands, so the row
+        // keeps its place in the layout without building a fresh default each repaint.
+        static EMPTY: LazyLock<Snapshot> = LazyLock::new(Snapshot::default);
+        let s = self.snap.as_ref().unwrap_or(&EMPTY);
+        let ctx = ui.ctx().clone();
         let w = (ui.available_width() - 3.0 * 12.0) / 4.0;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 12.0;
             let n = s.targets.iter().filter(|t| !t.keep).count();
-            stat(ui, w, t("Leftover targets"), &human(s.leftover()), &tf("{} folders", &[&n.to_string()]), n > 0);
+            let leftover = anim_bytes(&ctx, "leftover", s.leftover());
+            let n_shown = anim_count(&ctx, "leftover_n", n as u64);
+            stat(ui, w, t("Leftover targets"), &human(leftover), &tf("{} folders", &[&n_shown.to_string()]), n > 0);
             stat(
                 ui,
                 w,
                 t("Shared target"),
-                &if s.shared.is_some() { human(s.shared_size) } else { t("Off").into() },
+                &if s.shared.is_some() { human(anim_bytes(&ctx, "shared", s.shared_size)) } else { t("Off").into() },
                 &if s.shared.is_some() {
                     tf("cap {} GB", &[&self.cfg.max_size_gb.to_string()])
                 } else {
@@ -344,7 +405,7 @@ impl App {
                 },
                 s.shared.is_none(),
             );
-            stat(ui, w, t("Cargo cache"), &human(s.cache_size), t("~/.cargo downloads"), false);
+            stat(ui, w, t("Cargo cache"), &human(anim_bytes(&ctx, "cache", s.cache_size)), t("~/.cargo downloads"), false);
             let sub = match s.days_to_full {
                 Some(d) if d < 60.0 => tf("full in ~{} days", &[&format!("{d:.0}")]),
                 _ => tf("{} toolchains", &[&s.toolchains.len().to_string()]),
@@ -353,7 +414,7 @@ impl App {
                 ui,
                 w,
                 t("Free disk"),
-                &s.free.map(human).unwrap_or("–".into()),
+                &s.free.map(|f| human(anim_bytes(&ctx, "free", f))).unwrap_or("–".into()),
                 &sub,
                 s.free.is_some_and(|f| f < 20 << 30) || s.days_to_full.is_some_and(|d| d < 21.0),
             );
@@ -394,7 +455,7 @@ impl App {
     fn tabs(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             for (tab, name) in [
-                (Tab::Insights, t("✨ Insights")),
+                (Tab::Insights, t("Insights")),
                 (Tab::Projects, t("Projects")),
                 (Tab::Settings, t("Settings")),
                 (Tab::Activity, t("Activity")),
@@ -412,12 +473,12 @@ impl App {
         });
     }
 
-    fn insights(&mut self, ui: &mut egui::Ui) {
+    fn insights(&self, ui: &mut egui::Ui) {
         if !self.cfg.smart {
             empty(ui, t("Smart mode is off. Turn it on in Settings to get AI insights."));
             return;
         }
-        let Some(s) = self.snap.clone() else { return };
+        let Some(s) = self.snap.as_ref() else { return };
         // summary strip
         card(CARD).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -439,7 +500,7 @@ impl App {
         });
         ui.add_space(10.0);
         for ins in &s.insights {
-            let color = match ins.level {
+            let color = match ins.level() {
                 Level::Good => GOOD,
                 Level::Info => AI,
                 Level::Warn => WARN,
@@ -451,8 +512,8 @@ impl App {
                     ui.painter().rect_filled(r, 2.0, color);
                     ui.add_space(12.0);
                     ui.vertical(|ui| {
-                        ui.label(RichText::new(&ins.title).size(15.0).strong().color(TEXT));
-                        ui.label(RichText::new(&ins.detail).size(13.0).color(MUTED));
+                        ui.label(RichText::new(ins.title()).size(15.0).strong().color(TEXT));
+                        ui.label(RichText::new(ins.detail()).size(13.0).color(MUTED));
                     });
                 });
             });
@@ -466,10 +527,21 @@ impl App {
     }
 
     fn projects(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let Some(s) = self.snap.clone() else { return };
+        // Moved out of `self` for the frame rather than cloned: the row list can hold
+        // hundreds of paths and it was being deep-copied on every repaint.
+        let Some(s) = self.snap.take() else { return };
+        let changed = self.project_rows(ui, &s);
+        self.snap = Some(s);
+        if changed {
+            self.refresh(ctx);
+        }
+    }
+
+    /// Returns whether something on disk changed and the snapshot needs refreshing.
+    fn project_rows(&mut self, ui: &mut egui::Ui, s: &Snapshot) -> bool {
         if s.targets.is_empty() {
-            empty(ui, t("No per-project target/ folders found. 🎉"));
-            return;
+            empty_icon(ui, Icon::Check, GOOD, t("No per-project target/ folders found."));
+            return false;
         }
         let max = s.targets.iter().map(|t| t.size).max().unwrap_or(1).max(1);
         let mut changed = false;
@@ -503,8 +575,12 @@ impl App {
                     match row.reuse {
                         Some(p) if self.cfg.smart => {
                             let c = if p < 0.15 { MUTED } else if p < 0.5 { WARN } else { GOOD };
-                            ui.add_sized([70.0, 20.0], egui::Label::new(RichText::new(format!("✨ {:.0}%", p * 100.0)).color(c)))
-                                .on_hover_text(t("AI: chance you'll build this project again in the next 14 days"));
+                            ui.scope(|ui| {
+                                ui.set_width(70.0);
+                                icon_label(ui, Icon::Sparkle, 12.0, c, RichText::new(format!("{:.0}%", p * 100.0)).color(c));
+                            })
+                            .response
+                            .on_hover_text(t("AI: chance you'll build this project again in the next 14 days"));
                         }
                         _ => {
                             ui.add_space(78.0);
@@ -512,7 +588,7 @@ impl App {
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.add_enabled(!row.keep && self.busy.is_none(), ghost_button(t("Delete"))).clicked() {
-                            let freed = remove(&row.path, false);
+                            let freed = remove_known(&row.path, row.size, false);
                             self.toast(tf("Deleted {} target ({})", &[&name, &human(freed)]));
                             changed = true;
                         }
@@ -526,9 +602,7 @@ impl App {
                 });
             }
         });
-        if changed {
-            self.refresh(ctx);
-        }
+        changed
     }
 
     fn settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -562,15 +636,14 @@ impl App {
                 self.cfg.roots.remove(i);
             }
             ui.horizontal(|ui| {
-                if ui.add(ghost_button(t("+  Add folder…"))).clicked() {
-                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                        if !self.cfg.roots.contains(&p) {
-                            self.cfg.roots.push(p);
-                        }
-                    }
+                if ui.add(ghost_button(t("+  Add folder…"))).clicked()
+                    && let Some(p) = rfd::FileDialog::new().pick_folder()
+                    && !self.cfg.roots.contains(&p)
+                {
+                    self.cfg.roots.push(p);
                 }
-                if ui.add(ghost_button(t("Reset to detected"))).clicked() {
-                    self.cfg.roots = crate::config::default_roots();
+                if ui.add_enabled(self.busy.is_none(), ghost_button(t("Search this computer"))).clicked() {
+                    self.search_computer(ctx);
                 }
             });
             self.path_input(ui);
@@ -615,7 +688,7 @@ impl App {
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.add(ghost_button(t("Run setup wizard again"))).clicked() {
-                        self.wizard = Some(Wizard { step: 0, integrate: !crate::integrate::is_integrated() });
+                        self.wizard = Some(Wizard { step: 0, integrate: !crate::integrate::is_integrated(), searched: false });
                     }
                 });
             });
@@ -638,22 +711,29 @@ impl App {
     }
 
     fn draw_toast(&mut self, ctx: &egui::Context) {
-        let Some((text, at)) = &self.toast else { return };
-        if at.elapsed() > Duration::from_secs(4) {
+        // Held one frame past its life so the fade-out has something to animate.
+        let showing = self.toast.as_ref().is_some_and(|(_, at)| at.elapsed() < Duration::from_secs(4));
+        let alpha = fade(ctx, "toast", showing);
+        if alpha <= 0.001 {
             self.toast = None;
             return;
         }
-        ctx.request_repaint_after(Duration::from_millis(200));
-        egui::Area::new(egui::Id::new("toast"))
-            .anchor(egui::Align2::CENTER_TOP, vec2(0.0, 18.0))
+        let Some((text, _)) = &self.toast else { return };
+        ctx.request_repaint();
+
+        // Slides down into place as it fades in, and back up as it leaves.
+        let drop = 18.0 - 10.0 * (1.0 - alpha);
+        let tint = |c: Color32| c.gamma_multiply(alpha);
+        egui::Area::new(egui::Id::unique("toast"))
+            .anchor(egui::Align2::CENTER_TOP, vec2(0.0, drop))
             .show(ctx, |ui| {
                 Frame::new()
-                    .fill(CARD_HI)
-                    .stroke(Stroke::new(1.0_f32, LINE))
+                    .fill(tint(CARD_HI))
+                    .stroke(Stroke::new(1.0_f32, tint(LINE)))
                     .corner_radius(12)
                     .inner_margin(Margin::symmetric(18, 12))
                     .show(ui, |ui| {
-                        ui.label(RichText::new(text.as_str()).color(TEXT).size(14.5));
+                        ui.label(RichText::new(text.as_str()).color(tint(TEXT)).size(14.5));
                     });
             });
     }
@@ -672,14 +752,16 @@ impl App {
                     Some(rest) => dirs::home_dir().unwrap_or_default().join(rest.trim_start_matches(['/', '\\'])),
                     None => std::path::PathBuf::from(raw),
                 };
-                match p.canonicalize() {
-                    Ok(c) if c.is_dir() => {
-                        if !self.cfg.roots.contains(&c) {
-                            self.cfg.roots.push(c);
-                        }
-                        self.add_path.clear();
+                // Absolutised, not canonicalised: the user should see back the path
+                // they typed, not Windows' `\\?\` form of it.
+                let c = crate::util::tidy_abs(&p);
+                if c.is_dir() {
+                    if !self.cfg.roots.contains(&c) {
+                        self.cfg.roots.push(c);
                     }
-                    _ => self.toast(t("That folder doesn't exist")),
+                    self.add_path.clear();
+                } else {
+                    self.toast(t("That folder doesn't exist"));
                 }
             }
         });
@@ -689,7 +771,7 @@ impl App {
 // ---------------- setup wizard ----------------
 
 impl App {
-    fn wizard_ui(&mut self, ui: &mut egui::Ui) {
+    fn wizard_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let step = self.wizard.as_ref().map_or(0, |w| w.step);
         let width = ui.available_width().min(760.0);
         ui.vertical_centered(|ui| {
@@ -710,7 +792,7 @@ impl App {
                     ui.set_width(width - 58.0);
                     ui.vertical(|ui| match step {
                         0 => self.w_welcome(ui),
-                        1 => self.w_folders(ui),
+                        1 => self.w_folders(ui, ctx),
                         2 => self.w_prefs(ui),
                         3 => self.w_review(ui),
                         _ => self.w_done(ui),
@@ -734,12 +816,12 @@ impl App {
         });
         ui.add_space(22.0);
         for (icon, title, sub) in [
-            ("📦", t("One shared target folder"), t("Every project builds into the same place — no more target/ in each repo, and shared dependencies compile once.")),
-            ("⚡", t("Lean builds"), t("Dependencies skip debug info, which is often half the size. Your own code keeps it.")),
-            ("✨", t("Smart, and it cleans itself"), t("A tiny on-device model learns what you reuse and when you work, then cleans quietly every day.")),
+            (Icon::Package, t("One shared target folder"), t("Every project builds into the same place — no more target/ in each repo, and shared dependencies compile once.")),
+            (Icon::Bolt, t("Lean builds"), t("Dependencies skip debug info, which is often half the size. Your own code keeps it.")),
+            (Icon::Sparkle, t("Smart, and it cleans itself"), t("A tiny on-device model learns what you reuse and when you work, then cleans quietly every day.")),
         ] {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(icon).size(22.0).color(if icon == "✨" { AI } else { TEXT }));
+                icon_ui(ui, icon, 22.0, if icon == Icon::Sparkle { AI } else { TEXT });
                 ui.add_space(4.0);
                 ui.vertical(|ui| {
                     ui.label(RichText::new(title).strong().color(TEXT));
@@ -750,7 +832,16 @@ impl App {
         }
     }
 
-    fn w_folders(&mut self, ui: &mut egui::Ui) {
+    fn w_folders(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // Nothing to suggest from the usual places: go and actually look, once.
+        if self.cfg.roots.is_empty()
+            && self.busy.is_none()
+            && let Some(w) = self.wizard.as_mut()
+            && !w.searched
+        {
+            w.searched = true;
+            self.search_computer(ctx);
+        }
         ui.label(RichText::new(t("Where are your projects?")).size(22.0).strong().color(TEXT));
         ui.label(RichText::new(t("We found these folders. rtidy only looks inside them.")).color(MUTED));
         ui.add_space(14.0);
@@ -780,15 +871,20 @@ impl App {
         }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            if ui.add(ghost_button(t("+  Choose folder…"))).clicked() {
-                if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                    if !self.cfg.roots.contains(&p) {
-                        self.cfg.roots.push(p);
-                    }
+            if ui.add(ghost_button(t("+  Choose folder…"))).clicked()
+                && let Some(p) = rfd::FileDialog::new().pick_folder()
+            {
+                let p = crate::util::tidy_abs(&p);
+                if !self.cfg.roots.contains(&p) {
+                    self.cfg.roots.push(p);
                 }
             }
-            if ui.add(ghost_button(t("Reset to detected"))).clicked() {
-                self.cfg.roots = crate::config::default_roots();
+            if ui
+                .add_enabled(self.busy.is_none(), ghost_button(t("Search this computer")))
+                .on_hover_text(t("Look through every drive for folders that contain Cargo projects"))
+                .clicked()
+            {
+                self.search_computer(ctx);
             }
         });
         self.path_input(ui);
@@ -808,8 +904,12 @@ impl App {
             &tf("Runs quietly in the background via {}", &[mech]),
         );
         if self.cfg.auto_enabled && crate::schedule::exe_looks_temporary() {
-            ui.label(
-                RichText::new(t("⚠  Move rtidy to your Applications folder first, then open it from there — otherwise the daily clean-up can't find it."))
+            icon_label(
+                ui,
+                Icon::Warn,
+                15.0,
+                WARN,
+                RichText::new(t("Move rtidy to your Applications folder first, then open it from there — otherwise the daily clean-up can't find it."))
                     .color(WARN),
             );
         }
@@ -827,11 +927,11 @@ impl App {
             });
             ui.add_space(8.0);
         }
-        if crate::integrate::supported() {
-            if let Some(w) = self.wizard.as_mut() {
-                let label = if cfg!(windows) { t("Add to Start menu") } else { t("Add to app menu") };
-                option_row(ui, &mut w.integrate, label, t("So you can open rtidy like any other app"));
-            }
+        if crate::integrate::supported()
+            && let Some(w) = self.wizard.as_mut()
+        {
+            let label = if cfg!(windows) { t("Add to Start menu") } else { t("Add to app menu") };
+            option_row(ui, &mut w.integrate, label, t("So you can open rtidy like any other app"));
         }
         ui.add_space(8.0);
         ui.separator();
@@ -887,7 +987,7 @@ impl App {
                     });
                 }
                 for st in steps {
-                    ui.label(RichText::new(format!("✔  {st}")).color(TEXT));
+                    icon_label(ui, Icon::Check, 13.0, GOOD, RichText::new(&st).color(TEXT));
                 }
                 ui.add_space(6.0);
                 ui.label(
@@ -910,10 +1010,10 @@ impl App {
                 ui.label(RichText::new(t("Deleting files can take a minute.")).color(MUTED));
             } else {
                 if self.last_ok {
-                    ui.label(RichText::new("✔").size(54.0).color(GOOD));
+                    icon_ui(ui, Icon::Check, 54.0, GOOD);
                     ui.label(RichText::new(t("You're all set")).size(28.0).strong().color(TEXT));
                 } else {
-                    ui.label(RichText::new("⚠").size(54.0).color(WARN));
+                    icon_ui(ui, Icon::Warn, 54.0, WARN);
                     ui.label(RichText::new(t("Almost there")).size(28.0).strong().color(TEXT));
                 }
                 if let Some(msg) = &self.last_done {
@@ -945,7 +1045,7 @@ impl App {
                     0 => (t("Get started"), true),
                     1 => (t("Next"), !self.cfg.roots.is_empty()),
                     2 => (t("Next"), true),
-                    3 => (t("✨  Tidy up now"), !busy && self.snap.is_some()),
+                    3 => (t("Tidy up now"), !busy && self.snap.is_some()),
                     _ => (t("Open dashboard"), !busy),
                 };
                 let b = egui::Button::new(RichText::new(label).size(15.0).strong().color(Color32::WHITE))
@@ -959,10 +1059,10 @@ impl App {
                             self.refresh(ctx);
                         }
                         3 => {
-                            if self.wizard.as_ref().is_some_and(|w| w.integrate) {
-                                if let Err(e) = crate::integrate::integrate() {
-                                    self.toast(tf("Couldn't add to menu: {}", &[&e.to_string()]));
-                                }
+                            if self.wizard.as_ref().is_some_and(|w| w.integrate)
+                                && let Err(e) = crate::integrate::integrate()
+                            {
+                                self.toast(tf("Couldn't add to menu: {}", &[&e.to_string()]));
                             }
                             self.wizard.as_mut().unwrap().step = 4;
                             self.fix_all(ctx);
@@ -1003,7 +1103,7 @@ fn style(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 
     ctx.set_visuals(egui::Visuals::dark());
-    ctx.style_mut(|s| {
+    ctx.global_style_mut(|s| {
         s.spacing.item_spacing = vec2(10.0, 8.0);
         s.spacing.button_padding = vec2(14.0, 7.0);
         s.spacing.slider_width = 220.0;
@@ -1069,16 +1169,6 @@ fn lang_switch(ui: &mut egui::Ui, current: Lang) -> Option<Lang> {
     out
 }
 
-fn chip(ui: &mut egui::Ui, text: &str, color: Color32) {
-    Frame::new()
-        .fill(color.linear_multiply(0.18))
-        .corner_radius(8)
-        .inner_margin(Margin::symmetric(8, 2))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).size(11.5).color(color));
-        });
-}
-
 fn mini(ui: &mut egui::Ui, title: &str, value: &str, color: Color32) {
     ui.vertical(|ui| {
         ui.label(RichText::new(title).size(12.0).color(MUTED));
@@ -1120,6 +1210,18 @@ fn empty(ui: &mut egui::Ui, text: &str) {
     });
 }
 
+/// An empty state with a painted icon above the message.
+fn empty_icon(ui: &mut egui::Ui, icon: Icon, color: Color32, text: &str) {
+    card(CARD).inner_margin(Margin::same(28)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.vertical_centered(|ui| {
+            icon_ui(ui, icon, 30.0, color);
+            ui.add_space(8.0);
+            ui.label(RichText::new(text).size(15.0).color(MUTED));
+        });
+    });
+}
+
 fn option_row(ui: &mut egui::Ui, v: &mut bool, title: &str, sub: &str) {
     ui.horizontal(|ui| {
         toggle(ui, v);
@@ -1157,4 +1259,251 @@ fn short_log(l: &str) -> String {
     let date = l.get(..10).unwrap_or("");
     let rest = l.split("auto:").nth(1).unwrap_or("").replace(" total", "");
     format!("{date} ·{rest}")
+}
+
+// ---------------- icons ----------------
+//
+// Every symbol rtidy shows is drawn here rather than typed as a character.
+//
+// egui 0.37 moved its emoji fonts behind the optional `monochrome_emoji_fonts`
+// feature, so glyphs like ✨ and 📦 fell back to tofu boxes; relying on the host's
+// emoji font instead would render differently on Windows, macOS and Linux (and not
+// at all on a bare Linux container). Painted shapes have no font dependency: they
+// look the same everywhere, stay crisp at any DPI, and take the colour we ask for.
+
+/// The symbols the UI needs. Each is drawn inside a unit square and scaled to fit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Icon {
+    /// Smart/AI marker (was ✨)
+    Sparkle,
+    /// A shipping box: the shared target folder (was 📦)
+    Package,
+    /// Lightning: lean builds (was ⚡)
+    Bolt,
+    /// Success tick (was ✔ and 🎉)
+    Check,
+    /// Caution triangle (was ⚠)
+    Warn,
+    /// Circular arrow: rescan (was ⟳)
+    Refresh,
+}
+
+/// Convex quad through four unit-square points.
+fn quad(r: egui::Rect, pts: [(f32, f32); 4], color: Color32) -> egui::Shape {
+    let p = pts.iter().map(|&(x, y)| r.lerp_inside(vec2(x, y))).collect();
+    egui::Shape::convex_polygon(p, color, Stroke::NONE)
+}
+
+/// A four-pointed star, built from two convex diamonds so the tessellator never
+/// has to fill a concave path.
+fn star4(r: egui::Rect, c: (f32, f32), half: f32, color: Color32, out: &mut Vec<egui::Shape>) {
+    let (cx, cy) = c;
+    let w = half * 0.34; // waist: how fat the arms are
+    out.push(quad(r, [(cx, cy - half), (cx + w, cy), (cx, cy + half), (cx - w, cy)], color));
+    out.push(quad(r, [(cx - half, cy), (cx, cy - w), (cx + half, cy), (cx, cy + w)], color));
+}
+
+/// Draw `icon` to fill `rect` (a square is assumed; the shapes are centred in it).
+pub fn paint_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: Color32) {
+    let r = egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(rect.width().min(rect.height())));
+    let w = r.width();
+    let at = |x: f32, y: f32| r.lerp_inside(vec2(x, y));
+    let mut shapes: Vec<egui::Shape> = Vec::new();
+
+    match icon {
+        Icon::Sparkle => {
+            // One large star with two smaller companions, like the emoji it replaces.
+            star4(r, (0.40, 0.42), 0.38, color, &mut shapes);
+            star4(r, (0.78, 0.24), 0.17, color, &mut shapes);
+            star4(r, (0.74, 0.74), 0.22, color, &mut shapes);
+        }
+        Icon::Package => {
+            let s = Stroke::new(w * 0.09, color);
+            // Box outline, lid seam and tape down the front.
+            shapes.push(egui::Shape::rect_stroke(
+                egui::Rect::from_min_max(at(0.10, 0.22), at(0.90, 0.88)),
+                w * 0.08,
+                s,
+                egui::StrokeKind::Middle,
+            ));
+            shapes.push(egui::Shape::line_segment([at(0.10, 0.44), at(0.90, 0.44)], s));
+            shapes.push(egui::Shape::line_segment([at(0.50, 0.22), at(0.50, 0.44)], s));
+        }
+        Icon::Bolt => {
+            // Two triangles that overlap into a lightning bolt, each one convex.
+            shapes.push(quad(r, [(0.62, 0.06), (0.20, 0.58), (0.52, 0.58), (0.52, 0.58)], color));
+            shapes.push(quad(r, [(0.40, 0.94), (0.82, 0.42), (0.50, 0.42), (0.50, 0.42)], color));
+        }
+        Icon::Check => {
+            let s = Stroke::new(w * 0.14, color);
+            shapes.push(egui::Shape::line(vec![at(0.16, 0.54), at(0.40, 0.78), at(0.86, 0.24)], s));
+        }
+        Icon::Warn => {
+            let s = Stroke::new(w * 0.10, color);
+            shapes.push(egui::Shape::closed_line(
+                vec![at(0.50, 0.10), at(0.94, 0.86), at(0.06, 0.86)],
+                s,
+            ));
+            shapes.push(egui::Shape::line_segment([at(0.50, 0.38), at(0.50, 0.62)], s));
+            shapes.push(egui::Shape::circle_filled(at(0.50, 0.75), w * 0.055, color));
+        }
+        Icon::Refresh => {
+            // Open circle with an arrow head on the end, swept clockwise.
+            let s = Stroke::new(w * 0.11, color);
+            let (cx, cy, rad) = (0.5, 0.52, 0.36);
+            let arc: Vec<egui::Pos2> = (0..=28)
+                .map(|i| {
+                    let t = std::f32::consts::TAU * (0.08 + 0.80 * i as f32 / 28.0);
+                    at(cx + rad * t.cos(), cy + rad * t.sin())
+                })
+                .collect();
+            shapes.push(egui::Shape::line(arc, s));
+            let head = std::f32::consts::TAU * 0.08;
+            let (hx, hy) = (cx + rad * head.cos(), cy + rad * head.sin());
+            let a = w * 0.16 / w; // arrow half-size in unit space
+            shapes.push(quad(
+                r,
+                [(hx + a * 0.2, hy - a * 1.5), (hx + a * 1.4, hy + a * 0.4), (hx - a * 0.6, hy + a * 0.7), (hx - a * 0.6, hy + a * 0.7)],
+                color,
+            ));
+        }
+    }
+    painter.extend(shapes);
+}
+
+/// Allocate a square of `size` in the current layout and draw `icon` in it.
+pub fn icon_ui(ui: &mut egui::Ui, icon: Icon, size: f32, color: Color32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::Vec2::splat(size), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        paint_icon(ui.painter(), rect, icon, color);
+    }
+    resp
+}
+
+/// An icon followed by a text label, laid out on one line.
+/// Replaces the old `"✨  some text"` string literals, so no translated string
+/// has to carry a symbol in it.
+fn icon_label(ui: &mut egui::Ui, icon: Icon, size: f32, icon_color: Color32, text: RichText) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = size * 0.42;
+        icon_ui(ui, icon, size, icon_color);
+        ui.label(text);
+    });
+}
+
+/// A chip with a painted icon before its label.
+fn chip_icon(ui: &mut egui::Ui, icon: Icon, text: &str, color: Color32) {
+    Frame::new()
+        .fill(color.linear_multiply(0.18))
+        .corner_radius(8)
+        .inner_margin(Margin::symmetric(8, 2))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                icon_ui(ui, icon, 11.0, color);
+                ui.label(RichText::new(text).size(11.5).color(color));
+            });
+        });
+}
+
+/// A clickable button with a painted icon before its label.
+///
+/// Hand-drawn because egui's `Button` takes text or a texture, and these icons are
+/// vector shapes with no texture behind them. Kept visually in step with `style()`:
+/// same corner radius, same hover lift.
+#[allow(clippy::too_many_arguments)]
+fn icon_button(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    icon: Icon,
+    text: &str,
+    text_size: f32,
+    fill: Color32,
+    stroke: Color32,
+    fg: Color32,
+    min: egui::Vec2,
+) -> egui::Response {
+    let icon_size = text_size * 1.05;
+    let gap = text_size * 0.5;
+    let pad = vec2(16.0, 9.0);
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(text_size), fg);
+    let content = vec2(icon_size + gap + galley.size().x, galley.size().y.max(icon_size));
+    let size = (content + pad + pad).max(min);
+
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+    if ui.is_rect_visible(rect) {
+        let hovered = enabled && resp.hovered();
+        let bg = if hovered { fill.linear_multiply(1.18) } else { fill };
+        ui.painter().rect(rect, CornerRadius::same(12), bg, Stroke::new(1.0_f32, stroke), egui::StrokeKind::Inside);
+        let left = rect.center().x - content.x * 0.5;
+        let icon_rect =
+            egui::Rect::from_min_size(egui::pos2(left, rect.center().y - icon_size * 0.5), egui::Vec2::splat(icon_size));
+        paint_icon(ui.painter(), icon_rect, icon, fg);
+        let text_pos = egui::pos2(left + icon_size + gap, rect.center().y - galley.size().y * 0.5);
+        ui.painter().galley(text_pos, galley, fg);
+    }
+    if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp }
+}
+
+// ---------------- animation ----------------
+//
+// egui redraws only when something changes, so motion has to be asked for. Each
+// helper below drives a value through `Context::animate_*`, which interpolates
+// towards the target and schedules the next repaint until it arrives.
+
+/// Seconds for a value to travel to its new number.
+const COUNT_SECS: f32 = 0.55;
+/// Seconds for something to fade in or out.
+const FADE_SECS: f32 = 0.25;
+
+/// A byte count that glides to its new value instead of snapping.
+///
+/// Sizes change by gigabytes after a clean-up; watching the figure run down reads as
+/// "this happened", where a jump just looks like a glitch.
+fn anim_bytes(ctx: &egui::Context, key: &'static str, target: u64) -> u64 {
+    // f32 loses precision above ~16 MB, so animate in megabytes and scale back.
+    const UNIT: f64 = 1e6;
+    let scaled = (target as f64 / UNIT) as f32;
+    let now = ctx.animate_value_with_time(egui::Id::unique(("rtidy-anim", key)), scaled, COUNT_SECS);
+    (f64::from(now.max(0.0)) * UNIT) as u64
+}
+
+/// A plain counter that glides to its new value.
+fn anim_count(ctx: &egui::Context, key: &'static str, target: u64) -> u64 {
+    let now = ctx.animate_value_with_time(egui::Id::unique(("rtidy-anim", key)), target as f32, COUNT_SECS);
+    now.max(0.0).round() as u64
+}
+
+/// 0.0 while hidden, 1.0 while shown, easing between the two.
+fn fade(ctx: &egui::Context, key: &'static str, shown: bool) -> f32 {
+    ctx.animate_bool_with_time(egui::Id::unique(("rtidy-fade", key)), shown, FADE_SECS)
+}
+
+/// An indeterminate progress bar: a lozenge sweeping left to right.
+///
+/// Shown while a scan or a clean-up is running, so a long job looks like it is
+/// moving rather than frozen. Driven by egui's clock, so it keeps the frame rate
+/// steady instead of spinning the CPU.
+fn sweep_bar(ui: &mut egui::Ui, width: f32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 3.0), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, LINE);
+
+    // One pass every 1.4 s. `request_repaint` keeps it animating while visible.
+    const PERIOD: f64 = 1.4;
+    let phase = (ui.input(|i| i.time) % PERIOD) / PERIOD;
+    let span = rect.width() * 0.34;
+    // Ease in and out so the lozenge slows at each end rather than wrapping harshly.
+    let eased = 0.5 - 0.5 * (phase as f32 * std::f32::consts::TAU).cos();
+    let x = rect.left() - span + eased * (rect.width() + span);
+    let lozenge = egui::Rect::from_min_size(
+        egui::pos2(x.max(rect.left()), rect.top()),
+        vec2(span.min(rect.right() - x.max(rect.left())).max(0.0), rect.height()),
+    );
+    painter.rect_filled(lozenge, 2.0, ACCENT);
+    ui.ctx().request_repaint();
 }

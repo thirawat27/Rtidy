@@ -7,7 +7,6 @@ use crate::util::*;
 use crate::{cache, say, schedule, shared, targets};
 use anyhow::Result;
 use rayon::prelude::*;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
@@ -74,18 +73,6 @@ impl Snapshot {
     }
 }
 
-fn project_override(dir: &Path) -> Option<PathBuf> {
-    for name in ["config.toml", "config"] {
-        let p = dir.join(".cargo").join(name);
-        let Ok(text) = fs::read_to_string(&p) else { continue };
-        let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else { continue };
-        if doc.get("build").and_then(|b| b.get("target-dir")).is_some() {
-            return Some(p);
-        }
-    }
-    None
-}
-
 fn project_key(target: &Path) -> String {
     target.parent().unwrap_or(target).display().to_string()
 }
@@ -104,31 +91,58 @@ fn project_obs(ts: &[targets::Target], now: i64) -> Vec<ProjectObs> {
 pub fn snapshot(cfg: &Config) -> Snapshot {
     let roots = &cfg.roots;
     let now = brain::now();
-    let found = targets::find_targets(roots);
-    let obs = project_obs(&found, now);
-    let mut overrides = Vec::new();
-    targets::walk_projects(roots, |d| overrides.extend(project_override(d)));
-
     let shared = shared::shared_target_dir().ok().flatten();
-    let (shared_size, shared_incremental) = match &shared {
-        Some(d) => (dir_size(d), shared::profiles(d).iter().map(|p| dir_size(&p.join("incremental"))).sum()),
-        None => (0, 0),
-    };
+
+    // Five independent scans over different parts of the disk, one of them a
+    // subprocess (`schtasks` on Windows). Run together, the dashboard waits for the
+    // slowest instead of for their sum.
+    let (found, overrides, (shared_size, shared_incremental), cache_size, toolchains, scheduled, groups) =
+        std::thread::scope(|s| {
+            // One pass over the project tree yields both the target dirs and the
+            // per-project target-dir overrides.
+            let projects = s.spawn(|| {
+                let scan = targets::scan_tree(roots);
+                (targets::size_targets(scan.targets), scan.overrides)
+            });
+            let shared_sizes = s.spawn(|| match &shared {
+                Some(d) => {
+                    let profs = shared::profiles(d);
+                    rayon::join(
+                        || dir_size(d),
+                        || profs.par_iter().map(|p| dir_size(&p.join("incremental"))).sum::<u64>(),
+                    )
+                }
+                None => (0, 0),
+            });
+            let cache = s.spawn(|| cache::sizes().map(|c| c.registry_src + c.registry_cache + c.git).unwrap_or(0));
+            let tcs = s.spawn(shared::toolchain_sizes);
+            let sched = s.spawn(schedule::is_installed);
+            // Smart mode needs the build units too, and that is another pass over the
+            // shared dir: run it alongside the rest rather than after them.
+            let units = s.spawn(|| match (cfg.smart, shared.as_deref()) {
+                (true, Some(d)) => brain::scan_artifacts(d),
+                _ => Vec::new(),
+            });
+
+            let (found, overrides) = projects.join().unwrap_or_default();
+            (
+                found,
+                overrides,
+                shared_sizes.join().unwrap_or((0, 0)),
+                cache.join().unwrap_or(0),
+                tcs.join().unwrap_or_default(),
+                sched.join().unwrap_or(false),
+                units.join().unwrap_or_default(),
+            )
+        });
+
+    let obs = project_obs(&found, now);
     let lean = read_cargo_config().map(|(_, _, d)| shared::is_lean(&d)).unwrap_or(false);
-    let cache_size = cache::sizes().map(|c| c.registry_src + c.registry_cache + c.git).unwrap_or(0);
-
-    let tc_dir = rustup_home().map(|h| h.join("toolchains")).unwrap_or_default();
-    let tc_paths: Vec<PathBuf> = fs::read_dir(&tc_dir).into_iter().flatten().flatten().map(|e| e.path()).collect();
-    let mut toolchains: Vec<(String, u64)> = tc_paths
-        .into_par_iter()
-        .map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), dir_size(&p)))
-        .collect();
-    toolchains.sort_by(|a, b| b.1.cmp(&a.1));
-
     let free = roots.first().and_then(|r| free_space(r)).or_else(|| dirs::home_dir().and_then(|h| free_space(&h)));
+    // Only the tail matters, and the log outlives many runs.
     let last_run = log_path()
         .ok()
-        .and_then(|p| fs::read_to_string(p).ok())
+        .map(|p| read_tail(&p, 64 << 10))
         .and_then(|t| t.lines().rev().find(|l| l.contains("auto:")).map(str::to_string));
 
     let mut snap = Snapshot {
@@ -150,14 +164,13 @@ pub fn snapshot(cfg: &Config) -> Snapshot {
         toolchains,
         free,
         overrides,
-        scheduled: schedule::is_installed(),
+        scheduled,
         last_run,
         ..Default::default()
     };
 
     if cfg.smart {
         let mut b = Brain::load();
-        let groups = shared.as_deref().map(brain::scan_artifacts).unwrap_or_default();
         b.observe(now, &obs, &groups, free, shared_size);
         let _ = b.save();
         let mut rows = Vec::new();
@@ -203,14 +216,16 @@ pub fn fix_all(cfg: &Config) -> Result<FixReport> {
     shared::ensure_setup(cfg.lean)?;
     let now = brain::now();
     let mut b = cfg.smart.then(Brain::load);
+    // One scan feeds both the model and the clean-up; it used to be walked and sized
+    // twice whenever smart mode was on.
+    let found = targets::find_targets(&cfg.roots);
     if let Some(b) = b.as_mut() {
         // record leftovers before they go, so the model knows these projects
-        let found = targets::find_targets(&cfg.roots);
         b.observe(now, &project_obs(&found, now), &[], None, 0);
     }
     // With a shared dir, per-project target/ folders are dead weight: remove them all
     // (projects marked with .rtidy-keep are left alone).
-    let mut freed = targets::clean(&cfg.roots, 0, false);
+    let mut freed = targets::clean_found(found, 0, false);
     freed += match &b {
         Some(b) => shared::smart_gc(cfg, b, now, false)?,
         None => shared::gc(cfg.gc_days, cfg.max_size(), false)?,
@@ -265,7 +280,7 @@ pub fn auto_from_config(cfg: &Config) -> Result<u64> {
         let age = age_days(t.last_build);
         let p = b.project_reuse(&o.key, o.last_build, o.size, o.git_days, now);
         if age >= 3 && (p < tau_p || age >= cfg.days * 2) {
-            let got = remove(&t.path, false);
+            let got = remove_known(&t.path, t.size, false);
             if got > 0 {
                 say!("ai: deleted {} ({}, {:.0}% reuse chance)", t.path.display(), human(got), p * 100.0);
                 freed += got;

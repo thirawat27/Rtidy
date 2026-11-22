@@ -3,8 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::OnceLock;
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Lang {
@@ -31,22 +31,22 @@ pub fn detect() -> Lang {
     }
 }
 
-fn thai() -> &'static HashMap<&'static str, &'static str> {
-    static M: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
-    M.get_or_init(|| TH.iter().copied().collect())
-}
+/// Built once, on the first Thai lookup; English never pays for it.
+static THAI: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| TH.iter().copied().collect());
 
 pub fn t(en: &'static str) -> &'static str {
     match get() {
         Lang::En => en,
-        Lang::Th => thai().get(en).copied().unwrap_or(en),
+        Lang::Th => THAI.get(en).copied().unwrap_or(en),
     }
 }
 
 /// Translate, then replace each `{}` with the next argument.
 pub fn tf(en: &'static str, args: &[&str]) -> String {
-    let mut out = String::new();
-    let mut parts = t(en).split("{}");
+    let translated = t(en);
+    // One allocation: the result is the text plus the arguments, near enough.
+    let mut out = String::with_capacity(translated.len() + args.iter().map(|a| a.len()).sum::<usize>());
+    let mut parts = translated.split("{}");
     if let Some(first) = parts.next() {
         out.push_str(first);
     }
@@ -76,7 +76,7 @@ const TH: &[(&str, &str)] = &[
     ("Add to Start menu", "เพิ่มใน Start menu"),
     ("Add to app menu", "เพิ่มในเมนูแอป"),
     ("Add", "เพิ่ม"),
-    ("All tidy ✔", "เรียบร้อยแล้ว ✔"),
+    ("All tidy", "เรียบร้อยแล้ว"),
     ("All tidy! Freed {}", "เรียบร้อย! คืนพื้นที่ได้ {}"),
     ("Almost there", "เกือบเสร็จแล้ว"),
     ("Automatic daily clean-up is off", "ยังไม่ได้เปิดการล้างอัตโนมัติรายวัน"),
@@ -140,7 +140,7 @@ const TH: &[(&str, &str)] = &[
     ("Model is still learning your habits", "โมเดลยังเรียนรู้พฤติกรรมของคุณอยู่"),
     ("Never clean this project", "ไม่ล้างโปรเจกต์นี้"),
     ("Next", "ถัดไป"),
-    ("No per-project target/ folders found. 🎉", "ไม่พบโฟลเดอร์ target/ แยกตามโปรเจกต์ 🎉"),
+    ("No per-project target/ folders found.", "ไม่พบโฟลเดอร์ target/ แยกตามโปรเจกต์"),
     ("Normally about {}/day. A new toolchain, a big dependency or a release build?", "ปกติประมาณ {}/วัน อาจเป็น toolchain ใหม่, dependency ใหญ่ หรือ release build?"),
     ("Nothing yet this session. Scheduled runs are logged to:", "ยังไม่มีกิจกรรมในรอบนี้ ผลการรันตามเวลาจะบันทึกไว้ที่:"),
     ("Off — turn on to keep things tidy without thinking about it", "ปิดอยู่ เปิดไว้แล้วไม่ต้องคอยดูแลเอง"),
@@ -157,7 +157,12 @@ const TH: &[(&str, &str)] = &[
     ("Remove cargo downloads older than {} days", "ลบไฟล์ดาวน์โหลดของ Cargo ที่เก่ากว่า {} วัน"),
     ("Remove what you're unlikely to reuse first; clean harder when the disk is filling up", "ลบสิ่งที่ไม่น่าจะได้ใช้อีกก่อน และล้างเข้มขึ้นเมื่อดิสก์ใกล้เต็ม"),
     ("Remove", "เอาออก"),
-    ("Reset to detected", "ใช้ค่าที่ตรวจพบ"),
+    ("Added 1 project folder", "เพิ่มโฟลเดอร์โปรเจกต์ 1 โฟลเดอร์"),
+    ("Added {} project folders", "เพิ่มโฟลเดอร์โปรเจกต์ {} โฟลเดอร์"),
+    ("Look through every drive for folders that contain Cargo projects", "ค้นหาทุกไดรฟ์ เพื่อหาโฟลเดอร์ที่มีโปรเจกต์ Cargo อยู่จริง"),
+    ("No new project folders found", "ไม่พบโฟลเดอร์โปรเจกต์ใหม่"),
+    ("Search this computer", "ค้นหาในเครื่องนี้"),
+    ("Searching this computer…", "กำลังค้นหาในเครื่องนี้…"),
     ("Run setup wizard again", "เปิดตัวช่วยตั้งค่าอีกครั้ง"),
     ("Run the daily clean-up at the hour you build least", "ล้างประจำวันในชั่วโมงที่คุณ build น้อยที่สุด"),
     ("Runs quietly in the background via {}", "ทำงานเงียบๆ เบื้องหลังผ่าน {}"),
@@ -222,12 +227,12 @@ const TH: &[(&str, &str)] = &[
     ("{}d ago", "{} วันก่อน"),
     ("~/.cargo downloads", "ไฟล์ดาวน์โหลดใน ~/.cargo"),
     ("…or type a folder path", "…หรือพิมพ์ path ของโฟลเดอร์"),
-    ("⚠  Move rtidy to your Applications folder first, then open it from there — otherwise the daily clean-up can't find it.", "⚠  ย้าย rtidy ไปไว้ในโฟลเดอร์ Applications ก่อน แล้วเปิดจากตรงนั้น ไม่อย่างนั้นการล้างรายวันจะหาโปรแกรมไม่เจอ"),
-    ("✨ Insights", "✨ ข้อมูลเชิงลึก"),
-    ("✨ Smart mode", "✨ โหมดอัจฉริยะ"),
-    ("✨  Fix everything", "✨  จัดการทั้งหมด"),
-    ("✨  Tidy up now", "✨  จัดการเลย"),
-    ("⟳  Rescan", "⟳  สแกนใหม่"),
+    ("Move rtidy to your Applications folder first, then open it from there — otherwise the daily clean-up can't find it.", "ย้าย rtidy ไปไว้ในโฟลเดอร์ Applications ก่อน แล้วเปิดจากตรงนั้น ไม่อย่างนั้นการล้างรายวันจะหาโปรแกรมไม่เจอ"),
+    ("Insights", "ข้อมูลเชิงลึก"),
+    ("Smart mode", "โหมดอัจฉริยะ"),
+    ("Fix everything", "จัดการทั้งหมด"),
+    ("Tidy up now", "จัดการเลย"),
+    ("Rescan", "สแกนใหม่"),
 ];
 
 #[cfg(test)]
@@ -242,7 +247,7 @@ mod tests {
             include_str!("engine.rs"),
             include_str!("brain/mod.rs"),
         ];
-        let map = thai();
+        let map = &*THAI;
         let mut missing = Vec::new();
         for src in sources {
             for prefix in ["t(\"", "tf(\""] {

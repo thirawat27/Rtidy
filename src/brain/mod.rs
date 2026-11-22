@@ -107,7 +107,9 @@ pub struct ProjectObs {
 /// One build unit in the shared folder (its .fingerprint, deps and build files together).
 pub struct Group {
     pub key: String,
-    pub paths: Vec<PathBuf>,
+    /// Each member path with the size it was measured at, so the GC can delete it
+    /// without walking the tree a second time.
+    pub paths: Vec<(PathBuf, u64)>,
     pub size: u64,
     pub last_use: i64,
 }
@@ -133,14 +135,14 @@ pub fn scan_artifacts(shared: &Path) -> Vec<Group> {
             .collect();
         for sub in [".fingerprint", "deps", "build"] {
             for e in fs::read_dir(prof.join(sub)).into_iter().flatten().flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                let stem = name.split('.').next().unwrap_or(&name).to_string();
-                let unit = if fp.contains(&stem) {
-                    stem
-                } else if stem.starts_with("lib") && fp.contains(&stem[3..]) {
-                    stem[3..].to_string()
-                } else {
-                    stem
+                let file_name = e.file_name();
+                // Borrowed throughout: a shared dir holds tens of thousands of entries,
+                // and only the surviving group key needs to own its text.
+                let name = file_name.to_string_lossy();
+                let stem = name.split('.').next().unwrap_or(&name);
+                let unit = match stem.strip_prefix("lib") {
+                    Some(rest) if !fp.contains(stem) && fp.contains(rest) => rest,
+                    _ => stem,
                 };
                 let Ok(md) = e.metadata() else { continue };
                 let path = e.path();
@@ -155,15 +157,17 @@ pub fn scan_artifacts(shared: &Path) -> Vec<Group> {
                 } else {
                     (md.len(), used_time_file(&md))
                 };
-                let key = format!("{pname}/{unit}");
-                let g = groups.entry(key.clone()).or_insert_with(|| Group { key, paths: vec![], size: 0, last_use: 0 });
-                g.paths.push(path);
+                let g = groups
+                    .entry(format!("{pname}/{unit}"))
+                    .or_insert_with(|| Group { key: String::new(), paths: vec![], size: 0, last_use: 0 });
+                g.paths.push((path, size));
                 g.size += size;
                 g.last_use = g.last_use.max(last);
             }
         }
     }
-    groups.into_values().collect()
+    // The map key already is the group key: move it across instead of cloning per entry.
+    groups.into_iter().map(|(key, g)| Group { key, ..g }).collect()
 }
 
 /// Days since the project's git repo last changed (commit, checkout, staging).
@@ -390,11 +394,97 @@ pub enum Level {
     Warn,
 }
 
+/// Something worth telling the user, as data rather than as finished sentences.
+///
+/// The words are chosen when the insight is shown, not when it is computed. A scan
+/// runs on a background thread and its result outlives a language change, so an
+/// insight that stored rendered text stayed in whatever language was active when the
+/// scan happened — switching to Thai left these cards in English until the next scan.
 #[derive(Clone, Debug)]
-pub struct Insight {
-    pub level: Level,
-    pub title: String,
-    pub detail: String,
+pub enum Insight {
+    DiskFillingUp { days: f64, per_day: u64 },
+    DiskGrowing { per_day: u64 },
+    DiskShrinkingSlowly { per_day: u64 },
+    DiskLearning,
+    StaleArtifacts { bytes: u64, units: usize, cutoff_pct: f64 },
+    UnlikelyProjects { count: usize, bytes: u64, examples: String },
+    GrowthSpike { latest: u64, typical: u64 },
+    QuietHour { hour: u32, already_scheduled: bool },
+    ModelLearning { learned: u64 },
+    ModelAccuracy { learned: u64, accuracy: f64 },
+}
+
+impl Insight {
+    pub fn level(&self) -> Level {
+        match self {
+            Self::DiskFillingUp { days, .. } => {
+                if *days < 21.0 { Level::Warn } else { Level::Info }
+            }
+            Self::GrowthSpike { .. } => Level::Warn,
+            Self::DiskGrowing { .. } | Self::DiskShrinkingSlowly { .. } | Self::QuietHour { .. } => Level::Good,
+            _ => Level::Info,
+        }
+    }
+
+    /// Translated at the moment of display.
+    pub fn title(&self) -> String {
+        match self {
+            Self::DiskFillingUp { days, .. } => tf("Disk full in about {} days", &[&format!("{days:.0}")]),
+            Self::DiskGrowing { .. } | Self::DiskShrinkingSlowly { .. } => t("Disk space is stable").into(),
+            Self::DiskLearning => t("Learning your disk usage").into(),
+            Self::StaleArtifacts { bytes, .. } => {
+                tf("{} of build artifacts you probably won't need", &[&human(*bytes)])
+            }
+            Self::UnlikelyProjects { count, bytes, .. } => tf(
+                "{} projects you're unlikely to build soon ({})",
+                &[&count.to_string(), &human(*bytes)],
+            ),
+            Self::GrowthSpike { latest, .. } => tf("Unusual growth: +{} in a day", &[&human(*latest)]),
+            Self::QuietHour { hour, .. } => tf("You rarely build around {}:00", &[&format!("{hour:02}")]),
+            Self::ModelLearning { .. } => t("Model is still learning your habits").into(),
+            Self::ModelAccuracy { accuracy, .. } => {
+                tf("Prediction accuracy {}%", &[&format!("{:.0}", accuracy * 100.0)])
+            }
+        }
+    }
+
+    /// Translated at the moment of display.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::DiskFillingUp { per_day, .. } => tf(
+                "Free space is shrinking by about {}/day. rtidy cleans harder as it gets closer.",
+                &[&human(*per_day)],
+            ),
+            Self::DiskGrowing { per_day } => {
+                tf("Free space is growing by about {}/day.", &[&human(*per_day)])
+            }
+            Self::DiskShrinkingSlowly { per_day } => {
+                tf("Shrinking slowly ({}/day), nothing to worry about.", &[&human(*per_day)])
+            }
+            Self::DiskLearning => t("A forecast appears after a few days of history.").into(),
+            Self::StaleArtifacts { units, cutoff_pct, .. } => tf(
+                "{} build units have under {}% chance of being used in the next {} days. They go in the next clean-up.",
+                &[&units.to_string(), &format!("{cutoff_pct:.0}"), &format!("{HORIZON_DAYS:.0}")],
+            ),
+            Self::UnlikelyProjects { examples, .. } => {
+                tf("e.g. {}. Their target/ folders are safe to remove.", &[examples])
+            }
+            Self::GrowthSpike { typical, .. } => tf(
+                "Normally about {}/day. A new toolchain, a big dependency or a release build?",
+                &[&human(*typical)],
+            ),
+            Self::QuietHour { already_scheduled, .. } => if *already_scheduled {
+                t("Daily clean-up already runs then, so it never slows your builds.")
+            } else {
+                t("Smart schedule moves the daily clean-up there.")
+            }
+            .into(),
+            Self::ModelLearning { learned } | Self::ModelAccuracy { learned, .. } => tf(
+                "{} outcomes learned. Runs on this computer only; nothing is uploaded.",
+                &[&learned.to_string()],
+            ),
+        }
+    }
 }
 
 pub struct Analysis {
@@ -421,40 +511,23 @@ pub fn analyze(
     let (slope, dtf) = brain.forecast();
 
     // disk forecast
-    match (dtf, slope) {
-        (Some(d), _) if d < 60.0 => out.push(Insight {
-            level: if d < 21.0 { Level::Warn } else { Level::Info },
-            title: tf("Disk full in about {} days", &[&format!("{d:.0}")]),
-            detail: tf("Free space is shrinking by about {}/day. rtidy cleans harder as it gets closer.", &[&human(-slope.unwrap_or(0.0) as u64)]),
-        }),
-        (_, Some(s)) => out.push(Insight {
-            level: Level::Good,
-            title: t("Disk space is stable").into(),
-            detail: if s >= 0.0 {
-                tf("Free space is growing by about {}/day.", &[&human(s as u64)])
-            } else {
-                tf("Shrinking slowly ({}/day), nothing to worry about.", &[&human(-s as u64)])
-            },
-        }),
-        _ => out.push(Insight {
-            level: Level::Info,
-            title: t("Learning your disk usage").into(),
-            detail: t("A forecast appears after a few days of history.").into(),
-        }),
-    }
+    out.push(match (dtf, slope) {
+        (Some(d), _) if d < 60.0 => {
+            Insight::DiskFillingUp { days: d, per_day: -slope.unwrap_or(0.0) as u64 }
+        }
+        (_, Some(s)) if s >= 0.0 => Insight::DiskGrowing { per_day: s as u64 },
+        (_, Some(s)) => Insight::DiskShrinkingSlowly { per_day: -s as u64 },
+        _ => Insight::DiskLearning,
+    });
 
     // stale artifacts
     let stale: Vec<&Group> = groups.iter().filter(|g| brain.artifact_reuse(g, now) < tau_a).collect();
     let stale_bytes: u64 = stale.iter().map(|g| g.size).sum();
     if stale_bytes > 50 << 20 {
-        out.push(Insight {
-            level: Level::Info,
-            title: tf("{} of build artifacts you probably won't need", &[&human(stale_bytes)]),
-            detail: tf("{} build units have under {}% chance of being used in the next {} days. They go in the next clean-up.", &[
-                &stale.len().to_string(),
-                &format!("{:.0}", tau_a * 100.0),
-                &format!("{HORIZON_DAYS:.0}"),
-            ]),
+        out.push(Insight::StaleArtifacts {
+            bytes: stale_bytes,
+            units: stale.len(),
+            cutoff_pct: tau_a * 100.0,
         });
     }
 
@@ -463,20 +536,16 @@ pub fn analyze(
     if !unlikely.is_empty() {
         let bytes: u64 = unlikely.iter().map(|p| p.1).sum();
         let names: Vec<&str> = unlikely.iter().take(3).map(|p| p.0.as_str()).collect();
-        out.push(Insight {
-            level: Level::Info,
-            title: tf("{} projects you're unlikely to build soon ({})", &[&unlikely.len().to_string(), &human(bytes)]),
-            detail: tf("e.g. {}. Their target/ folders are safe to remove.", &[&names.join(", ")]),
+        out.push(Insight::UnlikelyProjects {
+            count: unlikely.len(),
+            bytes,
+            examples: names.join(", "),
         });
     }
 
     // growth spike
     if let Some((latest, typical)) = brain.growth_spike() {
-        out.push(Insight {
-            level: Level::Warn,
-            title: tf("Unusual growth: +{} in a day", &[&human(latest as u64)]),
-            detail: tf("Normally about {}/day. A new toolchain, a big dependency or a release build?", &[&human(typical.max(0.0) as u64)]),
-        });
+        out.push(Insight::GrowthSpike { latest: latest as u64, typical: typical.max(0.0) as u64 });
     }
 
     // quiet hour
@@ -485,26 +554,14 @@ pub fn analyze(
     if let Some(h) = quiet_hour {
         let current = auto_at.split(':').next().and_then(|x| x.parse::<u32>().ok());
         let same = current.is_some_and(|c| (c as i32 - h as i32).rem_euclid(24).min((h as i32 - c as i32).rem_euclid(24)) < 2);
-        out.push(Insight {
-            level: Level::Good,
-            title: tf("You rarely build around {}:00", &[&format!("{h:02}")]),
-            detail: if same {
-                t("Daily clean-up already runs then, so it never slows your builds.").into()
-            } else {
-                t("Smart schedule moves the daily clean-up there.").into()
-            },
-        });
+        out.push(Insight::QuietHour { hour: h, already_scheduled: same });
     }
 
     let (learned, accuracy) = brain.accuracy();
-    out.push(Insight {
-        level: Level::Info,
-        title: if learned < 30 {
-            t("Model is still learning your habits").into()
-        } else {
-            tf("Prediction accuracy {}%", &[&format!("{:.0}", accuracy * 100.0)])
-        },
-        detail: tf("{} outcomes learned. Runs on this computer only; nothing is uploaded.", &[&learned.to_string()]),
+    out.push(if learned < 30 {
+        Insight::ModelLearning { learned }
+    } else {
+        Insight::ModelAccuracy { learned, accuracy }
     });
 
     Analysis { insights: out, stale_artifacts: stale_bytes, days_to_full: dtf, pressure, learned, accuracy }

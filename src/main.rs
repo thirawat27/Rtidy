@@ -12,11 +12,13 @@
 mod brain;
 mod cache;
 mod config;
+mod discover;
 mod doctor;
 mod engine;
 mod gui;
 mod i18n;
 mod integrate;
+mod prune;
 mod schedule;
 mod shared;
 mod targets;
@@ -51,7 +53,21 @@ enum Cmd {
     /// Health check: where the space went and what to do about it
     Doctor { roots: Vec<PathBuf> },
     /// List per-project target/ dirs with size and last build time
-    Scan { roots: Vec<PathBuf> },
+    Scan {
+        roots: Vec<PathBuf>,
+        /// Walk every folder, ignoring the remembered "no Rust here" notes
+        #[arg(long)]
+        deep: bool,
+    },
+    /// Search every drive for folders that hold Cargo projects
+    Find {
+        /// Give up after this many seconds and report what was found
+        #[arg(long, default_value_t = 20)]
+        timeout: u64,
+        /// Save the result as the project folders rtidy watches
+        #[arg(long)]
+        save: bool,
+    },
     /// Delete per-project target/ dirs not built for N days
     Clean {
         roots: Vec<PathBuf>,
@@ -141,7 +157,7 @@ impl AutoOpts {
     fn to_config(&self) -> Result<Config> {
         let mut c = Config::load();
         if !self.roots.is_empty() {
-            c.roots = self.roots.iter().map(|r| r.canonicalize()).collect::<std::io::Result<_>>()?;
+            c.roots = self.roots.iter().map(|r| util::tidy_abs(r)).collect();
         }
         if let Some(v) = self.days {
             c.days = v;
@@ -161,7 +177,7 @@ impl AutoOpts {
     fn to_args(&self) -> Result<Vec<String>> {
         let mut a = Vec::new();
         for r in &self.roots {
-            a.push(plain(&r.canonicalize()?));
+            a.push(plain(&util::tidy_abs(r)));
         }
         let mut flag = |name: &str, v: Option<u64>| {
             if let Some(v) = v {
@@ -196,7 +212,9 @@ fn attach_console() {
 
 fn main() -> Result<()> {
     let cli = Cli::parse_from(wild_args());
-    i18n::set(Config::load().lang);
+    // One read of the settings file covers the language and every command below.
+    let saved = Config::load();
+    i18n::set(saved.lang);
     let cmd = match cli.cmd {
         None | Some(Cmd::Gui) => {
             gui::run().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -215,9 +233,9 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Fix { roots } => {
-            let mut cfg = Config::load();
+            let mut cfg = saved;
             if !roots.is_empty() {
-                cfg.roots = roots.iter().map(|r| r.canonicalize()).collect::<std::io::Result<_>>()?;
+                cfg.roots = roots.iter().map(|r| util::tidy_abs(r)).collect();
             }
             let folders: Vec<String> = cfg.roots.iter().map(|r| r.display().to_string()).collect();
             println!("project folders: {}", folders.join(", "));
@@ -226,16 +244,16 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Insights => {
-            let mut cfg = Config::load();
+            let mut cfg = saved;
             cfg.smart = true;
             let s = engine::snapshot(&cfg);
             for i in &s.insights {
-                let tag = match i.level {
+                let tag = match i.level() {
                     brain::Level::Good => "[ok]  ",
                     brain::Level::Info => "[ai]  ",
                     brain::Level::Warn => "[warn]",
                 };
-                println!("{tag} {}\n       {}", i.title, i.detail);
+                println!("{tag} {}\n       {}", i.title(), i.detail());
             }
             for r in s.targets.iter().filter(|r| !r.keep) {
                 if let Some(p) = r.reuse {
@@ -245,11 +263,32 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Doctor { roots } => {
-            let roots = if roots.is_empty() { Config::load().roots } else { roots };
+            let roots = if roots.is_empty() { saved.roots } else { roots };
             doctor::run(&roots)
         }
-        Cmd::Scan { roots } => {
-            targets::scan(&roots_or_cwd(&roots)?);
+        Cmd::Scan { roots, deep } => {
+            targets::scan(&roots_or_cwd(&roots)?, deep);
+            Ok(())
+        }
+        Cmd::Find { timeout, save } => {
+            let seeds = discover::search_seeds();
+            let shown: Vec<String> = seeds.iter().map(|s| plain(s)).collect();
+            println!("searching {} ({}s budget)\n", shown.join(", "), timeout);
+            let found = discover::discover_roots(std::time::Duration::from_secs(timeout));
+            if found.is_empty() {
+                println!("no folders with Cargo projects found");
+                return Ok(());
+            }
+            for f in &found {
+                println!("  {}", f.display());
+            }
+            println!("\n{} folder(s)", found.len());
+            if save {
+                let mut cfg = saved;
+                cfg.roots = found;
+                cfg.save()?;
+                println!("saved to {}", Config::path()?.display());
+            }
             Ok(())
         }
         Cmd::Clean { roots, days, dry_run } => {
@@ -268,16 +307,16 @@ fn main() -> Result<()> {
         Cmd::Auto(o) => {
             util::enable_file_log();
             let cfg = o.to_config()?;
-            if let (Some(min), Some(free)) = (o.min_free, cfg.roots.first().and_then(|r| free_space(r))) {
-                if free >= min {
-                    say!("auto: {} free (>= {}), nothing to do", human(free), human(min));
-                    return Ok(());
-                }
+            if let (Some(min), Some(free)) = (o.min_free, cfg.roots.first().and_then(|r| free_space(r)))
+                && free >= min
+            {
+                say!("auto: {} free (>= {}), nothing to do", human(free), human(min));
+                return Ok(());
             }
             engine::auto_from_config(&cfg).map(drop)
         }
         Cmd::Schedule { at, remove, opts } => {
-            let mut cfg = Config::load();
+            let mut cfg = saved;
             if remove {
                 schedule::remove()?;
                 cfg.auto_enabled = false;
@@ -296,7 +335,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Log { n } => {
-            let text = std::fs::read_to_string(util::log_path()?).unwrap_or_default();
+            // Only the tail is ever printed, so only the tail is read.
+            let text = util::read_tail(&util::log_path()?, 256 << 10);
             let lines: Vec<&str> = text.lines().collect();
             for l in &lines[lines.len().saturating_sub(n)..] {
                 println!("{l}");

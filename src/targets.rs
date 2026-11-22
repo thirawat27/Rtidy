@@ -28,39 +28,218 @@ fn is_cargo_target(dir: &Path) -> bool {
             || dir.join("release").is_dir())
 }
 
+/// Directories a Rust build output will never be under.
+///
+/// A root is often a whole drive, and the time a scan takes is almost entirely the
+/// time spent walking subtrees like `SteamLibrary` or `Windows` that cannot contain
+/// anything rtidy would clean.
+///
+/// Dot-directories are deliberately *not* skipped here: worktrees under `.claude`,
+/// `.worktrees` and the like hold real `target/` folders worth gigabytes. (Root
+/// *discovery* does skip them — see `crate::discover` — because a checkout copied
+/// into a tool's cache is not a project the user is working on.)
 fn skip_dir(name: &str) -> bool {
-    matches!(name, ".git" | "node_modules" | ".cargo" | ".rustup" | "$RECYCLE.BIN" | "AppData")
+    // ASCII-insensitive: Windows paths vary in case between machines.
+    const SKIP: [&str; 20] = [
+        // package caches and vendored code: any target/ in here belongs to a dependency
+        ".git",
+        ".hg",
+        ".svn",
+        "node_modules",
+        ".cargo",
+        ".rustup",
+        ".nuget",
+        ".gradle",
+        // OS and application trees
+        "appdata",
+        "$recycle.bin",
+        "system volume information",
+        "windows",
+        "winsxs",
+        "program files",
+        "program files (x86)",
+        "programdata",
+        "windowsapps",
+        "msocache",
+        "perflogs",
+        "$winreagent",
+    ];
+    SKIP.iter().any(|s| name.eq_ignore_ascii_case(s))
 }
 
-/// Walk roots, calling `f` on every directory (not descending into target/ or junk dirs).
-pub fn walk_projects(roots: &[PathBuf], mut on_dir: impl FnMut(&Path)) {
-    for root in roots {
-        let mut it = WalkDir::new(root).follow_links(false).into_iter();
-        while let Some(entry) = it.next() {
-            let Ok(e) = entry else { continue };
-            if !e.file_type().is_dir() {
-                continue;
-            }
-            if e.depth() > 0 && skip_dir(&e.file_name().to_string_lossy()) {
-                it.skip_current_dir();
-                continue;
-            }
-            on_dir(e.path());
-            if is_cargo_target(e.path()) {
-                it.skip_current_dir();
-            }
-        }
+/// What one pass over the project tree finds.
+#[derive(Default)]
+pub struct TreeScan {
+    /// Cargo `target/` directories.
+    pub targets: Vec<PathBuf>,
+    /// Project-local `.cargo/config.toml` files that set their own `build.target-dir`.
+    pub overrides: Vec<PathBuf>,
+    /// Directories actually walked, for the prune cache and for reporting.
+    pub visited: u32,
+    /// Directories a prune note let this scan skip.
+    pub skipped: u32,
+}
+
+impl TreeScan {
+    fn merge(mut self, other: Self) -> Self {
+        self.targets.extend(other.targets);
+        self.overrides.extend(other.overrides);
+        self.visited += other.visited;
+        self.skipped += other.skipped;
+        self
+    }
+
+    /// Nothing here that rtidy would ever act on.
+    fn is_empty_of_rust(&self) -> bool {
+        self.targets.is_empty() && self.overrides.is_empty()
     }
 }
 
-pub fn find_targets(roots: &[PathBuf]) -> Vec<Target> {
-    let mut paths = Vec::new();
-    walk_projects(roots, |d| {
-        if is_cargo_target(d) {
-            paths.push(d.to_path_buf());
+/// Walk one subtree, single-threaded.
+fn walk_subtree(start: &Path) -> TreeScan {
+    let mut out = TreeScan::default();
+    let mut visited = 0u32;
+    let mut it = WalkDir::new(start).follow_links(false).into_iter();
+    while let Some(entry) = it.next() {
+        let Ok(e) = entry else { continue };
+        if !e.file_type().is_dir() {
+            continue;
         }
-    });
-    // Sizing is the slow part: do it in parallel.
+        let name = e.file_name().to_string_lossy();
+        // A `.cargo` directory means its *parent* may pin its own target-dir.
+        // Noticing it as we pass costs nothing — the walk already listed it — and
+        // the config files are then read for just those few directories. Asking
+        // every directory whether it has a `.cargo` child cost one stat each, and
+        // on a drive-sized root those stats were most of the scan.
+        if name == ".cargo" {
+            if let Some(parent) = e.path().parent()
+                && let Some(p) = crate::shared::project_override(parent)
+            {
+                out.overrides.push(p);
+            }
+            it.skip_current_dir();
+            continue;
+        }
+        if e.depth() > 0 && skip_dir(&name) {
+            it.skip_current_dir();
+            continue;
+        }
+        visited += 1;
+        if is_cargo_target(e.path()) {
+            out.targets.push(e.path().to_path_buf());
+            it.skip_current_dir();
+        }
+    }
+    out.visited = visited;
+    out
+}
+
+/// How many levels below a root to cut into separate units of work.
+///
+/// One level does not share the load evenly: a drive root has a few enormous children
+/// and a long tail of tiny ones, so a single-level split leaves one core walking the
+/// big one while the others finish and idle. Two levels gives the pool enough pieces
+/// to keep every core busy, without the bookkeeping of splitting deeper.
+const SPLIT_DEPTH: usize = 2;
+
+/// Collect the units of work below `start`, checking each directory on the way.
+///
+/// Directories above the split depth are handled here and now; everything below
+/// becomes a unit for the pool.
+fn split_units(start: &Path, depth: usize, units: &mut Vec<PathBuf>) -> TreeScan {
+    let mut here = TreeScan::default();
+    if start.join(".cargo").is_dir()
+        && let Some(p) = crate::shared::project_override(start)
+    {
+        here.overrides.push(p);
+    }
+    if is_cargo_target(start) {
+        here.targets.push(start.to_path_buf());
+        return here; // nothing below a target dir is ours
+    }
+    for e in fs::read_dir(start).into_iter().flatten().flatten() {
+        if !e.file_type().is_ok_and(|t| t.is_dir()) || skip_dir(&e.file_name().to_string_lossy()) {
+            continue;
+        }
+        if depth > 1 {
+            here = here.merge(split_units(&e.path(), depth - 1, units));
+        } else {
+            units.push(e.path());
+        }
+    }
+    here
+}
+
+/// One pass over every root, with the subtrees walked in parallel.
+///
+/// Walking a drive-sized root one directory at a time was the slowest thing rtidy
+/// did. The tree is cut into independent subtrees and handed to the thread pool,
+/// which sizes itself to the machine: this uses the cores that are actually there,
+/// rather than spawning a thread per folder.
+/// A full pass that walks everything, ignoring the prune cache.
+pub fn scan_all(roots: &[PathBuf]) -> TreeScan {
+    scan_inner(roots, None).0
+}
+
+/// The usual pass: skips subtrees a recent walk found to hold no Rust.
+///
+/// See `crate::prune` for what that means and what it costs.
+pub fn scan_tree(roots: &[PathBuf]) -> TreeScan {
+    let mut cache = crate::prune::Prune::load();
+    let (scan, learned) = scan_inner(roots, Some(&cache));
+    // Fold in what this pass learned, then persist.
+    for (dir, dirs, empty) in learned {
+        if empty {
+            cache.remember_empty(&dir, dirs);
+        } else {
+            cache.forget(&dir);
+        }
+    }
+    cache.tidy();
+    let _ = cache.save();
+    scan
+}
+
+/// What one unit's walk taught us: its path, how many directories it held, and
+/// whether it turned out to contain nothing rtidy acts on.
+type Learned = (PathBuf, u32, bool);
+
+/// Returns the scan plus what each unit taught the prune cache.
+fn scan_inner(roots: &[PathBuf], cache: Option<&crate::prune::Prune>) -> (TreeScan, Vec<Learned>) {
+    let mut units: Vec<PathBuf> = Vec::new();
+    let mut top = TreeScan::default();
+    for root in roots {
+        top = top.merge(split_units(root, SPLIT_DEPTH, &mut units));
+    }
+
+    let walked: Vec<(TreeScan, Option<Learned>)> = units
+        .par_iter()
+        .map(|u| {
+            if cache.is_some_and(|c| c.can_skip(u)) {
+                // Untouched since a walk that found nothing: leave it alone.
+                return (TreeScan { skipped: 1, ..Default::default() }, None);
+            }
+            let scan = walk_subtree(u);
+            let learned = (u.clone(), scan.visited, scan.is_empty_of_rust());
+            (scan, Some(learned))
+        })
+        .collect();
+
+    let mut out = top;
+    let mut learned: Vec<Learned> = Vec::new();
+    for (scan, note) in walked {
+        out = out.merge(scan);
+        learned.extend(note);
+    }
+    (out, learned)
+}
+
+pub fn find_targets(roots: &[PathBuf]) -> Vec<Target> {
+    size_targets(scan_tree(roots).targets)
+}
+
+/// Measure the target dirs a scan turned up. Sizing is the slow part: do it in parallel.
+pub fn size_targets(paths: Vec<PathBuf>) -> Vec<Target> {
     let mut out: Vec<Target> = paths
         .into_par_iter()
         .map(|p| Target {
@@ -70,7 +249,7 @@ pub fn find_targets(roots: &[PathBuf]) -> Vec<Target> {
             path: p,
         })
         .collect();
-    out.sort_by(|a, b| b.size.cmp(&a.size));
+    out.sort_unstable_by_key(|t| std::cmp::Reverse(t.size));
     out
 }
 
@@ -84,28 +263,48 @@ fn last_build(p: &Path) -> SystemTime {
         .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
-pub fn scan(roots: &[PathBuf]) {
-    let ts = find_targets(roots);
+pub fn scan(roots: &[PathBuf], deep: bool) {
+    let scan = if deep { scan_all(roots) } else { scan_tree(roots) };
+    let skipped = scan.skipped;
+    let ts = size_targets(scan.targets);
     for t in &ts {
         let tag = if t.keep { " [keep]" } else { "" };
         println!("{:>10}  {:>4}d ago  {}{tag}", human(t.size), age_days(t.last_build), t.path.display());
     }
     let total: u64 = ts.iter().map(|t| t.size).sum();
     println!("{} target dirs, {} total", ts.len(), human(total));
+    if skipped > 0 {
+        println!("skipped {skipped} folder(s) known to hold no Rust (--deep to walk everything)");
+    }
 }
 
 pub fn clean(roots: &[PathBuf], days: u64, dry_run: bool) -> u64 {
+    clean_found(find_targets(roots), days, dry_run)
+}
+
+/// `clean` for callers that already scanned, so the tree is walked and sized once.
+pub fn clean_found(found: Vec<Target>, days: u64, dry_run: bool) -> u64 {
+    let victims: Vec<Target> = found.into_iter().filter(|t| !t.keep && age_days(t.last_build) >= days).collect();
+
+    // Removing a folder is I/O bound and the folders are independent. On NTFS in
+    // particular, deleting several large target dirs at once finishes far sooner than
+    // one after another, where each removal waits on the filesystem by itself.
+    // Results are collected first so the log still reads in a stable order.
+    let done: Vec<(PathBuf, u64, u64)> = victims
+        .into_par_iter()
+        .map(|t| {
+            let got = remove_known(&t.path, t.size, dry_run);
+            (t.path, t.size, got)
+        })
+        .collect();
+
     let mut freed = 0;
-    for t in find_targets(roots) {
-        if t.keep || age_days(t.last_build) < days {
+    for (path, size, got) in done {
+        if got == 0 && size > 0 {
+            say!("skip (in use?) {}", path.display());
             continue;
         }
-        let got = remove(&t.path, dry_run);
-        if got == 0 && t.size > 0 {
-            say!("skip (in use?) {}", t.path.display());
-            continue;
-        }
-        say!("{} {} ({})", if dry_run { "would delete" } else { "deleted" }, t.path.display(), human(got));
+        say!("{} {} ({})", if dry_run { "would delete" } else { "deleted" }, path.display(), human(got));
         freed += got;
     }
     say!("targets: {} {}", if dry_run { "would free" } else { "freed" }, human(freed));

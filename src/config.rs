@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
@@ -71,28 +71,54 @@ impl Config {
     }
 
     pub fn max_size(&self) -> Option<u64> {
-        (self.max_size_gb > 0).then(|| self.max_size_gb << 30)
+        (self.max_size_gb > 0).then_some(self.max_size_gb << 30)
     }
 }
 
-/// Common places people keep code. Falls back to the home folder.
+/// A quick first guess at where the projects are: the usual code folders under home,
+/// but only the ones that really contain a Cargo project.
+///
+/// This runs on the main thread while settings load, so it only probes a known short
+/// list — it never walks the machine. `crate::discover::discover_roots` does the real
+/// search, in the background, and the UI offers it as "Search this computer".
+///
+/// Folders are kept only on evidence. The old version added `Documents` and
+/// `Downloads` merely because they existed, which pointed rtidy at large folders with
+/// no Rust in them and showed the user places they had nothing to do with.
 pub fn default_roots() -> Vec<PathBuf> {
-    let Some(home) = dirs::home_dir() else { return vec![] };
+    let Some(home) = dirs::home_dir() else { return Vec::new() };
     let names = [
         "projects", "Projects", "dev", "Dev", "code", "Code", "src", "source", "repos", "workspace",
-        "git", "GitHub", "RustroverProjects", "Developer", "Documents", "Desktop", "Downloads",
+        "git", "GitHub", "RustroverProjects", "Developer", "rust", "Rust",
     ];
     let mut out: Vec<PathBuf> = Vec::new();
     for n in names {
         let p = home.join(n);
-        if let Ok(c) = p.canonicalize() {
-            if c.is_dir() && !out.contains(&c) {
-                out.push(c);
+        if p.is_dir() && holds_cargo_project(&p, 2) {
+            let p = crate::util::tidy_abs(&p);
+            if !out.contains(&p) {
+                out.push(p);
             }
         }
     }
-    if out.is_empty() {
-        out.push(home);
-    }
     out
+}
+
+/// Is there a `Cargo.toml` in `dir`, or within `depth` levels below it?
+///
+/// Deliberately shallow and cheap: this decides whether to *offer* a folder, and the
+/// full search is a separate, bounded background job.
+fn holds_cargo_project(dir: &Path, depth: usize) -> bool {
+    if dir.join("Cargo.toml").is_file() {
+        return true;
+    }
+    if depth == 0 {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(dir) else { return false };
+    entries.flatten().any(|e| {
+        e.file_type().is_ok_and(|t| t.is_dir())
+            && !e.file_name().to_string_lossy().starts_with('.')
+            && holds_cargo_project(&e.path(), depth - 1)
+    })
 }

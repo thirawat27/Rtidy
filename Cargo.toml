@@ -1,19 +1,21 @@
 [package]
 name = "rtidy"
 version = "0.3.0"
-edition = "2021"
+edition = "2024"
+# Edition 2024 needs 1.85; let-chains in that edition need 1.88.
+rust-version = "1.88"
 description = "Find, clean and prevent scattered Rust target/ directories"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 walkdir = "2"
-toml_edit = "0.22"
-dirs = "5"
+toml_edit = "0.25"
+dirs = "7"
 anyhow = "1"
 rayon = "1.12.0"
 humantime = "2.4.0"
 fs4 = "1.1.0"
-eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 rfd = "0.18.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -23,9 +25,20 @@ sys-locale = "0.3.2"
 [profile.release]
 strip = true
 lto = true
+# One codegen unit lets LLVM inline across the whole crate: a smaller binary, and
+# the walk-and-stat loops that dominate every scan optimise better.
+codegen-units = 1
+# Unwinding is kept on purpose: a panic in a rayon worker mid-delete should unwind and
+# be reported, not abort the process partway through a clean-up.
+panic = "unwind"
+
+# rtidy's own advice, applied to rtidy: dependencies build without debug info, so this
+# project's own share of the shared target dir stays small and its links stay fast.
+[profile.dev.package."*"]
+debug = false
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

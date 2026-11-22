@@ -6,8 +6,8 @@ pub fn weighted_slope(points: &[(f64, f64)], half_life: f64) -> Option<f64> {
     if points.len() < 4 {
         return None;
     }
-    let t_max = points.iter().map(|p| p.0).fold(f64::MIN, f64::max);
-    let t_min = points.iter().map(|p| p.0).fold(f64::MAX, f64::min);
+    let t_max = points.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+    let t_min = points.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
     if t_max - t_min < 2.0 {
         return None; // need at least two days of history
     }
@@ -32,10 +32,18 @@ pub fn days_until_full(free_now: f64, slope_per_day: f64) -> Option<f64> {
     (slope_per_day < 0.0).then(|| free_now / -slope_per_day)
 }
 
+/// `select_nth_unstable_by` only partitions around the index it needs, so this is
+/// linear instead of the O(n log n) of a full sort. `total_cmp` is a total order on
+/// floats, so unlike `partial_cmp().unwrap()` it cannot panic on a NaN.
 fn median(v: &mut [f64]) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = v.len();
-    if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2.0 }
+    let (lo, mid, _) = v.select_nth_unstable_by(n / 2, f64::total_cmp);
+    if n % 2 == 1 {
+        return *mid;
+    }
+    // Even length: pair it with the largest value below it.
+    let below = lo.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    f64::midpoint(below, *mid)
 }
 
 /// Robust anomaly test (median + MAD): is `latest` far above the usual values?
@@ -63,7 +71,7 @@ pub fn quietest_hour(hours: &[u32], min_events: usize) -> Option<u32> {
     }
     (0..24u32).min_by(|&a, &b| {
         let s = |h: u32| hist[((h + 23) % 24) as usize] + 2.0 * hist[h as usize] + hist[((h + 1) % 24) as usize];
-        s(a).partial_cmp(&s(b)).unwrap()
+        s(a).total_cmp(&s(b))
     })
 }
 
@@ -80,6 +88,18 @@ mod tests {
         assert!((days_until_full(82.0, s).unwrap() - 41.0).abs() < 1e-6);
         assert!(days_until_full(82.0, 1.0).is_none());
         assert!(weighted_slope(&pts[..3], 7.0).is_none());
+    }
+
+    #[test]
+    fn median_odd_and_even() {
+        // Odd length: the middle value. Even: the mean of the middle pair.
+        assert_eq!(median(&mut [3.0, 1.0, 2.0]), 2.0);
+        assert_eq!(median(&mut [4.0, 1.0, 3.0, 2.0]), 2.5);
+        assert_eq!(median(&mut [1.0]), 1.0);
+        assert_eq!(median(&mut [5.0, 5.0]), 5.0);
+        // Order of the input must not matter.
+        assert_eq!(median(&mut [9.0, 0.0, 7.0, 1.0, 8.0]), 7.0);
+        assert_eq!(median(&mut [0.0, 1.0, 7.0, 8.0, 9.0]), 7.0);
     }
 
     #[test]

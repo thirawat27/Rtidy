@@ -3,9 +3,7 @@
 use crate::util::*;
 use crate::{cache, shared, targets};
 use anyhow::Result;
-use rayon::prelude::*;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn ok(msg: &str) {
     println!("  [ok]   {msg}");
@@ -16,19 +14,6 @@ fn warn(msg: &str, fix: &str) {
 }
 fn info(msg: &str) {
     println!("  [info] {msg}");
-}
-
-/// A project-local .cargo/config.toml that sets its own target-dir bypasses the shared dir.
-fn project_override(dir: &Path) -> Option<PathBuf> {
-    for name in ["config.toml", "config"] {
-        let p = dir.join(".cargo").join(name);
-        let Ok(text) = fs::read_to_string(&p) else { continue };
-        let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else { continue };
-        if doc.get("build").and_then(|b| b.get("target-dir")).is_some() {
-            return Some(p);
-        }
-    }
-    None
 }
 
 pub fn run(roots: &[PathBuf]) -> Result<()> {
@@ -69,7 +54,10 @@ pub fn run(roots: &[PathBuf]) -> Result<()> {
 
     // --- leftovers and overrides ---
     println!("\nprojects");
-    let ts = targets::find_targets(roots);
+    // One pass over the project tree for both the target dirs and the overrides.
+    let scan = targets::scan_tree(roots);
+    let overrides = scan.overrides;
+    let ts = targets::size_targets(scan.targets);
     let total: u64 = ts.iter().map(|t| t.size).sum();
     if ts.is_empty() {
         ok("no per-project target/ folders");
@@ -84,12 +72,6 @@ pub fn run(roots: &[PathBuf]) -> Result<()> {
             println!("         {:>10}  {}", human(t.size), t.path.display());
         }
     }
-    let mut overrides = Vec::new();
-    targets::walk_projects(roots, |d| {
-        if let Some(p) = project_override(d) {
-            overrides.push(p);
-        }
-    });
     for p in &overrides {
         warn(
             &format!("{} sets its own target-dir", p.display()),
@@ -112,17 +94,7 @@ pub fn run(roots: &[PathBuf]) -> Result<()> {
 
     // --- toolchains ---
     println!("\nrust toolchains");
-    let tc_dir = rustup_home()?.join("toolchains");
-    let mut tcs: Vec<(String, u64)> = fs::read_dir(&tc_dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .collect::<Vec<_>>()
-        .into_par_iter()
-        .map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), dir_size(&p)))
-        .collect();
-    tcs.sort_by(|a, b| b.1.cmp(&a.1));
+    let tcs = shared::toolchain_sizes();
     for (name, size) in &tcs {
         println!("         {:>10}  {name}", human(*size));
     }
@@ -151,10 +123,10 @@ pub fn run(roots: &[PathBuf]) -> Result<()> {
             ));
         }
     }
-    if let Ok(log) = log_path() {
-        if let Some(last) = fs::read_to_string(&log).ok().and_then(|t| t.lines().last().map(str::to_string)) {
-            info(&format!("last run: {last}"));
-        }
+    if let Ok(log) = log_path()
+        && let Some(last) = read_tail(&log, 8 << 10).lines().last().map(str::to_string)
+    {
+        info(&format!("last run: {last}"));
     }
     Ok(())
 }

@@ -3,9 +3,50 @@
 use crate::say;
 use crate::util::*;
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+/// A project-local `.cargo/config.toml` that sets its own target-dir bypasses the
+/// shared dir. One definition, used by both the dashboard and `rtidy doctor`.
+pub fn project_override(dir: &Path) -> Option<PathBuf> {
+    // `~/.cargo/config.toml` is the *global* config — the very file rtidy writes
+    // `build.target-dir` into. When a root is the home directory (or any ancestor of
+    // CARGO_HOME) it would otherwise be reported as a project fighting the shared
+    // dir, which is backwards: it is the shared dir.
+    let global = cargo_config_path().ok();
+    for name in ["config.toml", "config"] {
+        let p = dir.join(".cargo").join(name);
+        if global.as_deref().is_some_and(|g| same_file(g, &p)) {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&p) else { continue };
+        let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else { continue };
+        if doc.get("build").and_then(|b| b.get("target-dir")).is_some() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Two paths that name the same file, comparing them in their plain absolute form so
+/// Windows' `\\?\` prefix and a trailing-slash difference do not hide a match.
+fn same_file(a: &Path, b: &Path) -> bool {
+    tidy_abs(a) == tidy_abs(b)
+}
+
+/// Installed rustup toolchains with their sizes, largest first.
+pub fn toolchain_sizes() -> Vec<(String, u64)> {
+    let Ok(dir) = rustup_home().map(|h| h.join("toolchains")) else { return Vec::new() };
+    let paths: Vec<PathBuf> = fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).collect();
+    let mut out: Vec<(String, u64)> = paths
+        .into_par_iter()
+        .map(|p| (p.file_name().unwrap_or_default().to_string_lossy().into_owned(), dir_size(&p)))
+        .collect();
+    out.sort_unstable_by_key(|(_, size)| std::cmp::Reverse(*size));
+    out
+}
 
 pub fn shared_target_dir() -> Result<Option<PathBuf>> {
     if let Ok(d) = std::env::var("CARGO_TARGET_DIR") {
@@ -143,7 +184,7 @@ pub fn smart_gc(cfg: &crate::config::Config, b: &crate::brain::Brain, now: i64, 
 
     let groups = crate::brain::scan_artifacts(&shared);
     let mut scored: Vec<(f64, &crate::brain::Group)> = groups.iter().map(|g| (b.artifact_reuse(g, now), g)).collect();
-    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
     let mut current: u64 = groups.iter().map(|g| g.size).sum();
     let mut units = 0;
     for (p, g) in scored {
@@ -156,8 +197,8 @@ pub fn smart_gc(cfg: &crate::config::Config, b: &crate::brain::Brain, now: i64, 
             continue;
         }
         let mut got = 0;
-        for path in &g.paths {
-            got += remove(path, dry_run);
+        for (path, size) in &g.paths {
+            got += remove_known(path, *size, dry_run);
         }
         current = current.saturating_sub(got);
         freed += got;
@@ -194,24 +235,31 @@ pub fn gc(days: u64, max_size: Option<u64>, dry_run: bool) -> Result<u64> {
         }
     }
 
-    let mut entries: Vec<(SystemTime, PathBuf)> = Vec::new();
+    // One directory read yields each entry's mtime and, for plain files, its size --
+    // no extra stat, and no second walk at delete time.
+    let mut entries: Vec<(SystemTime, PathBuf, Option<u64>)> = Vec::new();
     for p in &profs {
         for sub in ["deps", "build", ".fingerprint"] {
             for e in fs::read_dir(p.join(sub)).into_iter().flatten().flatten() {
-                entries.push((mtime(&e.path()), e.path()));
+                let Ok(md) = e.metadata() else { continue };
+                let size = md.is_file().then_some(md.len());
+                entries.push((md.modified().unwrap_or(SystemTime::UNIX_EPOCH), e.path(), size));
             }
         }
     }
-    entries.sort();
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
     let cutoff = SystemTime::now() - Duration::from_secs(days * 86_400);
     let mut current = dir_size(&shared).saturating_sub(if dry_run { freed } else { 0 });
-    for (t, path) in entries {
+    for (t, path, size) in entries {
         let over = max_size.is_some_and(|m| current > m);
         if t >= cutoff && !over {
             break; // sorted oldest-first: nothing older remains
         }
-        let got = remove(&path, dry_run);
+        let got = match size {
+            Some(s) => remove_known(&path, s, dry_run),
+            None => remove(&path, dry_run), // a directory: its size still needs a walk
+        };
         current = current.saturating_sub(got);
         freed += got;
     }

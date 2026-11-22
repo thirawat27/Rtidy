@@ -2,7 +2,7 @@
 //! - Windows: Task Scheduler (per-user, no admin)
 //! - macOS:   launchd LaunchAgent (catches up after sleep)
 //! - Linux:   systemd user timer (Persistent=true catches up after power-off),
-//!            falling back to the user's crontab when systemd isn't available.
+//!   falling back to the user's crontab when systemd isn't available.
 
 use crate::util::*;
 use anyhow::{bail, Context, Result};
