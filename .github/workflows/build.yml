@@ -115,26 +115,6 @@ jobs:
           name: dist-${{ matrix.name }}
           path: dist/
 
-  # Build logs are committed to the ci-logs branch so they can be read with plain git.
-  report:
-    needs: [build, release]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: logs-*
-          path: logs
-      - name: Push logs to ci-logs branch
-        run: |
-          cd logs
-          git init -q -b ci-logs
-          git config user.name "github-actions"
-          git config user.email "github-actions@users.noreply.github.com"
-          echo "run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID  sha: $GITHUB_SHA  result: ${{ needs.build.result }}  release: ${{ needs.release.result }}" > README
-          git add -A && git commit -qm "logs for ${GITHUB_SHA::7}"
-          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" ci-logs
-
   release:
     needs: build
     # Only when you push a v* tag yourself; normal pushes never create a release.
