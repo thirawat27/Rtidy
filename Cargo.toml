@@ -2,10 +2,10 @@
 name = "rtidy"
 version = "1.0.0"
 edition = "2024"
-# rtidy is built and tested against current stable. The language features it uses
-# (edition 2024, let-chains) go back to 1.85 and 1.88, but Cargo reorganised the target
-# directory in 1.100 and that is the layout rtidy is developed against.
-rust-version = "1.100"
+# The oldest toolchain rtidy is known to build on, checked by compiling against it
+# rather than inferred from the language features it happens to use. Raising this
+# locks people out of `cargo install` for no gain, so it stays as low as is verified.
+rust-version = "1.99"
 authors = ["Thirawat Sinlapasomsak (https://github.com/thirawat27)"]
 description = "Find, clean and prevent scattered Rust target/ directories"
 license = "GPL-3.0-only"

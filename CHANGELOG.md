@@ -68,7 +68,7 @@ Measured on a 112,000-directory drive:
 
 ### Notes
 
-- Requires Rust 1.100 or newer to build; the crate uses the 2024 edition.
+- Requires Rust 1.99 or newer to build; the crate uses the 2024 edition.
 - Understands both the Cargo target layout used up to 1.99 and the one introduced in
   1.100, so a shared folder filled by either toolchain is managed correctly.
 - The run log is capped and rotated, so an unattended daily clean-up cannot fill the
