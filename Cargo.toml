@@ -2,9 +2,33 @@
 name = "rtidy"
 version = "1.0.0"
 edition = "2024"
-# Edition 2024 needs 1.85; let-chains in that edition need 1.88.
-rust-version = "1.88"
+# rtidy is built and tested against current stable. The language features it uses
+# (edition 2024, let-chains) go back to 1.85 and 1.88, but Cargo reorganised the target
+# directory in 1.100 and that is the layout rtidy is developed against.
+rust-version = "1.100"
+authors = ["Thirawat Sinlapasomsak (https://github.com/thirawat27)"]
 description = "Find, clean and prevent scattered Rust target/ directories"
+license = "GPL-3.0-only"
+repository = "https://github.com/thirawat27/Rtidy"
+readme = "README.md"
+keywords = ["cargo", "target", "disk", "cleanup", "build"]
+categories = ["development-tools::cargo-plugins", "command-line-utilities"]
+# Screenshots and the oversized logo are for the README on GitHub; nothing here is
+# needed to build, so they stay out of the published crate.
+exclude = [
+    "assets/showcase/*",
+    "assets/logo-1024.png",
+    "assets/logo.svg",
+    ".github/*",
+]
+
+[features]
+default = ["gui"]
+# The desktop app. It brings in eframe, which is most of rtidy's dependency tree and
+# needs X11/Wayland development headers on Linux, so
+# `cargo install rtidy --no-default-features` gives a light CLI-only build that
+# compiles anywhere.
+gui = ["dep:eframe", "dep:rfd"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -15,8 +39,8 @@ anyhow = "1"
 rayon = "1.12.0"
 humantime = "2.4.0"
 fs4 = "1.1.0"
-eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
-rfd = "0.18.0"
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"], optional = true }
+rfd = { version = "0.18.0", optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }

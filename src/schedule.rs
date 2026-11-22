@@ -31,6 +31,7 @@ pub fn exe_path() -> Result<PathBuf> {
 
 /// Running from somewhere that will disappear (a mounted .dmg, macOS App Translocation):
 /// a scheduled task pointing there would break.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub fn exe_looks_temporary() -> bool {
     exe_path().is_ok_and(|p| {
         let s = p.to_string_lossy();
@@ -78,6 +79,7 @@ pub fn is_installed() -> bool {
 }
 
 /// Human description of the mechanism, for the UI.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub fn mechanism() -> &'static str {
     if cfg!(windows) {
         "Windows Task Scheduler"

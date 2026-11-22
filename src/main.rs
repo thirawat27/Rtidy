@@ -1,5 +1,17 @@
 //! rtidy — find, clean and prevent scattered Rust `target/` directories.
 //!
+//! Copyright (C) 2026 Thirawat Sinlapasomsak <https://github.com/thirawat27>
+//!
+//! This program is free software: you can redistribute it and/or modify it under the
+//! terms of the GNU General Public License as published by the Free Software
+//! Foundation, version 3.
+//!
+//! This program is distributed in the hope that it will be useful, but WITHOUT ANY
+//! WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+//! PARTICULAR PURPOSE. See the GNU General Public License for more details. You should
+//! have received a copy of the GNU General Public License along with this program; see
+//! the LICENSE file, or <https://www.gnu.org/licenses/>.
+//!
 //! Run with no arguments to open the app, or `rtidy fix` to do everything from a terminal.
 //! Root-cause fix: every project shares ONE target dir (`build.target-dir` in
 //! ~/.cargo/config.toml), so new `target/` folders stop appearing; a daily task keeps
@@ -15,6 +27,7 @@ mod config;
 mod discover;
 mod doctor;
 mod engine;
+#[cfg(feature = "gui")]
 mod gui;
 mod i18n;
 mod integrate;
@@ -47,6 +60,7 @@ enum Cmd {
         roots: Vec<PathBuf>,
     },
     /// Open the app (same as running with no arguments)
+    #[cfg(feature = "gui")]
     Gui,
     /// AI insights: disk forecast, what you won't reuse, unusual growth, quiet hours
     Insights,
@@ -215,6 +229,7 @@ fn main() -> Result<()> {
     // One read of the settings file covers the language and every command below.
     let saved = Config::load();
     i18n::set(saved.lang);
+    #[cfg(feature = "gui")]
     let cmd = match cli.cmd {
         None | Some(Cmd::Gui) => {
             gui::run().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -222,7 +237,20 @@ fn main() -> Result<()> {
         }
         Some(c) => c,
     };
+    // Built without the desktop app: there is nothing to open, so show the commands.
+    #[cfg(not(feature = "gui"))]
+    let cmd = match cli.cmd {
+        Some(c) => c,
+        None => {
+            use clap::CommandFactory;
+            Cli::command().print_help()?;
+            println!();
+            println!("this build has no desktop app; install with the `gui` feature for one.");
+            return Ok(());
+        }
+    };
     match cmd {
+        #[cfg(feature = "gui")]
         Cmd::Gui => unreachable!(),
         Cmd::Uninstall => {
             schedule::remove()?;

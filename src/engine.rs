@@ -10,6 +10,7 @@ use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub struct TargetRow {
     pub path: PathBuf,
     pub size: u64,
@@ -20,6 +21,9 @@ pub struct TargetRow {
 }
 
 #[derive(Clone, Default)]
+// Most of this is the dashboard's view of the machine; a CLI-only build fills it in
+// but only reads a few fields back.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub struct Snapshot {
     pub targets: Vec<TargetRow>,
     pub shared: Option<PathBuf>,
@@ -44,13 +48,17 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    // `leftover`, `reclaimable` and `issues` are what the dashboard summarises.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub fn leftover(&self) -> u64 {
         self.targets.iter().filter(|t| !t.keep).map(|t| t.size).sum()
     }
     /// What "Fix everything" could roughly give back.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub fn reclaimable(&self) -> u64 {
         self.leftover() + self.shared_incremental + self.cache_size / 2 + self.stale_artifacts
     }
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     pub fn issues(&self) -> Vec<String> {
         let mut v = Vec::new();
         if self.shared.is_none() {
@@ -244,6 +252,8 @@ pub fn snapshot(cfg: &Config) -> Snapshot {
     snap
 }
 
+// The app shows these; the CLI prints its own progress as it goes.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub struct FixReport {
     pub freed: u64,
     pub warnings: Vec<String>,

@@ -76,7 +76,24 @@ build จาก source (ดูด้านล่าง) หรือดาวน
 | macOS (Intel + Apple Silicon) | `rtidy-macos-universal.dmg` ลากไปใส่ Applications เปิดครั้งแรก: คลิกขวา → Open |
 | Linux | `rtidy_<ver>_amd64.deb`, `rtidy-x86_64.AppImage` หรือ `rtidy-linux-x86_64.tar.gz` |
 
-หรือ build จาก source: `cargo install --git https://github.com/thirawat27/rtidy`
+### ติดตั้งด้วย cargo
+
+```sh
+cargo install rtidy                           # แอป + CLI
+cargo install rtidy --no-default-features     # เฉพาะ CLI ไม่มีแอปเดสก์ท็อป
+```
+
+แอปเดสก์ท็อปคือ feature ชื่อ `gui` ซึ่งเปิดไว้เป็นค่าเริ่มต้น มันดึง `eframe` เข้ามา
+ซึ่งเป็น dependency ส่วนใหญ่ของ rtidy (135 crates เทียบกับ 55) และบน Linux ต้องมี
+dev headers ของ X11/Wayland ด้วย ถ้าใช้ `--no-default-features` จะได้เฉพาะเครื่องมือ
+บรรทัดคำสั่ง ไฟล์ 2 MB build ได้ทุกที่โดยไม่ต้องมี system library อะไรเลย
+ความสามารถอื่นๆ เหมือนเดิมทุกอย่าง ต่างแค่ไม่มีหน้าต่าง
+
+ติดตั้งจาก repository ตรงๆ โดยไม่ผ่าน crates.io:
+
+```sh
+cargo install --git https://github.com/thirawat27/Rtidy
+```
 
 ## วิธีใช้
 
@@ -90,3 +107,15 @@ rtidy fix ~/code     # หรือระบุโฟลเดอร์เอง
 ```
 
 ดูคำสั่งทั้งหมดและข้อควรรู้เพิ่มเติมได้ใน [README ภาษาอังกฤษ](README.md#use)
+
+## ผู้พัฒนา
+
+**Thirawat Sinlapasomsak** — [github.com/thirawat27](https://github.com/thirawat27)
+
+## ใบอนุญาต
+
+สงวนลิขสิทธิ์ © 2026 Thirawat Sinlapasomsak
+
+rtidy เป็นซอฟต์แวร์เสรีภายใต้ [GNU General Public License v3.0](LICENSE)
+คุณใช้ ศึกษา แจกจ่าย และแก้ไขได้ แต่ถ้าแจกจ่ายรุ่นที่แก้ไขแล้ว
+ต้องใช้ใบอนุญาตเดียวกันและแนบ source ไปด้วย ซอฟต์แวร์นี้ไม่มีการรับประกันใดๆ

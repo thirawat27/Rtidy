@@ -80,7 +80,24 @@ Build from source (see below), or download installers from **Actions → build �
 | macOS (Intel + Apple Silicon) | `rtidy-macos-universal.dmg` — drag to Applications. First launch: right-click → Open (not notarized) |
 | Linux | `rtidy_<ver>_amd64.deb`, `rtidy-x86_64.AppImage`, or `rtidy-linux-x86_64.tar.gz` |
 
-Or from source: `cargo install --git https://github.com/thirawat27/rtidy`
+### With cargo
+
+```sh
+cargo install rtidy                           # app + CLI
+cargo install rtidy --no-default-features     # CLI only, no desktop app
+```
+
+The desktop app is the `gui` feature, and it is on by default. It brings in `eframe`,
+which is most of rtidy's dependency tree (135 crates against 55) and needs X11/Wayland
+development headers on Linux. `--no-default-features` builds just the command-line tool:
+a 2 MB binary that compiles anywhere with no system libraries. Everything except the
+window works the same.
+
+Straight from the repository, without crates.io:
+
+```sh
+cargo install --git https://github.com/thirawat27/Rtidy
+```
 
 ## Use
 
@@ -122,3 +139,15 @@ Put an empty `.rtidy-keep` file next to a project's `Cargo.toml` to never clean 
 - A project with its own `target-dir` setting keeps it (`rtidy doctor` lists these).
 - On Windows the app is a GUI program; in a terminal its output appears after the prompt returns.
 - To undo the shared folder, delete `target-dir` under `[build]` in `~/.cargo/config.toml` (a backup is saved as `config.toml.bak`).
+
+## Author
+
+**Thirawat Sinlapasomsak** — [github.com/thirawat27](https://github.com/thirawat27)
+
+## License
+
+Copyright © 2026 Thirawat Sinlapasomsak.
+
+rtidy is free software under the [GNU General Public License v3.0](LICENSE). You may
+use, study, share and change it; if you distribute a changed version, it has to stay
+under the same licence and ship its source. It comes with no warranty.

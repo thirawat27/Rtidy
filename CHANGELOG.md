@@ -36,6 +36,18 @@ the cargo download cache small.
 - `.rtidy-keep` next to a `Cargo.toml` protects that project's `target/` from any
   clean-up.
 - `rtidy doctor` explains where the disk space went and what to do about it.
+- **Installable with cargo**, either from crates.io or straight from the repository:
+
+  ```sh
+  cargo install rtidy                        # app + CLI
+  cargo install rtidy --no-default-features  # CLI only
+  cargo install --git https://github.com/thirawat27/Rtidy
+  ```
+
+  The desktop app is the `gui` feature and is on by default. Turning it off drops the
+  dependency tree from 135 crates to 55 and the binary to about 2 MB, and removes the
+  need for X11/Wayland development headers on Linux, so a CLI-only install builds
+  anywhere. Everything except the window behaves the same.
 
 ### Performance
 
@@ -56,10 +68,11 @@ Measured on a 112,000-directory drive:
 
 ### Notes
 
-- Requires Rust 1.88 or newer to build; the crate uses the 2024 edition.
+- Requires Rust 1.100 or newer to build; the crate uses the 2024 edition.
 - Understands both the Cargo target layout used up to 1.99 and the one introduced in
   1.100, so a shared folder filled by either toolchain is managed correctly.
 - The run log is capped and rotated, so an unattended daily clean-up cannot fill the
   disk it is meant to be freeing.
 - All icons are drawn as vector shapes rather than typed as emoji, so they render
   identically on Windows, macOS and Linux and do not depend on a system font.
+- Licensed under the GNU General Public License v3.0.

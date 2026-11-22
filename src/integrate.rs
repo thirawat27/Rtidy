@@ -15,6 +15,7 @@ use std::path::PathBuf;
 const LOGO_PNG: &[u8] = include_bytes!("../assets/logo.png");
 
 /// Whether this OS needs/supports an "add to app menu" step.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub fn supported() -> bool {
     cfg!(any(windows, all(unix, not(target_os = "macos"))))
 }
@@ -29,6 +30,7 @@ fn shortcut() -> Result<PathBuf> {
     Ok(dirs::data_dir().context("no data dir")?.join(r"Microsoft\Windows\Start Menu\Programs\rtidy.lnk"))
 }
 
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub fn is_integrated() -> bool {
     #[cfg(all(unix, not(target_os = "macos")))]
     return desktop_file().is_ok_and(|p| p.exists())
@@ -39,6 +41,7 @@ pub fn is_integrated() -> bool {
     return true;
 }
 
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub fn integrate() -> Result<()> {
     let exe = exe_path()?;
     #[cfg(all(unix, not(target_os = "macos")))]
