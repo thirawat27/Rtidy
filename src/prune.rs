@@ -48,6 +48,13 @@ const FORMAT: u32 = 2;
 pub struct Prune {
     #[serde(default)]
     version: u32,
+    /// Which ecosystems the notes were taken with, as ids joined by commas.
+    ///
+    /// "Holds nothing rtidy cares about" is only true relative to what rtidy was
+    /// looking for. Turn Node on and every folder full of `node_modules` that was
+    /// written off as empty is suddenly interesting, so those notes have to go.
+    #[serde(default)]
+    lens: String,
     /// Folder path → what the last walk of it found.
     empty: HashMap<String, Note>,
 }
@@ -66,7 +73,7 @@ fn dir_mtime(p: &Path) -> i64 {
 
 impl Prune {
     fn path() -> Option<PathBuf> {
-        Some(dirs::cache_dir()?.join("rtidy").join("prune.json"))
+        crate::config::cache_dir().ok().map(|d| d.join("prune.json"))
     }
 
     pub fn load() -> Self {
@@ -119,6 +126,17 @@ impl Prune {
         self.empty.retain(|k, n| now - n.checked < TTL_SECS && Path::new(k).is_dir());
     }
 
+    /// The ecosystem set these notes were taken with.
+    pub fn lens(&self) -> &str {
+        &self.lens
+    }
+
+    /// Start again under a different ecosystem set: every note is about a question that
+    /// is no longer the one being asked.
+    pub fn relens(&mut self, lens: &str) {
+        self.lens = lens.to_string();
+        self.empty.clear();
+    }
 }
 
 #[cfg(test)]

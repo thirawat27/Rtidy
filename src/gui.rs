@@ -4,7 +4,7 @@ use crate::brain::Level;
 use crate::config::Config;
 use crate::engine::{self, Snapshot};
 use crate::i18n::{self, t, tf, Lang};
-use crate::util::{human, remove_known, LOG_LINES};
+use crate::util::{human, LOG_LINES};
 use eframe::egui::{
     self, vec2, Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Sense, Stroke, TextureHandle,
 };
@@ -45,6 +45,8 @@ pub fn run() -> eframe::Result {
 
 enum Msg {
     Snapshot(Box<Snapshot>),
+    /// A clean-up worked out but not carried out (see `crate::plan`).
+    Planned(Box<crate::plan::Plan>),
     Done(String, bool),
     /// Folders found by searching the computer (see `crate::discover`).
     Found(Vec<std::path::PathBuf>),
@@ -53,6 +55,7 @@ enum Msg {
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
     Insights,
+    Preview,
     Projects,
     Settings,
     Activity,
@@ -73,6 +76,8 @@ struct App {
     last_done: Option<String>,
     last_ok: bool,
     add_path: String,
+    /// The plan the Preview tab is showing, if one has been worked out.
+    preview: Option<crate::plan::Plan>,
 }
 
 /// First-run setup wizard state.
@@ -86,6 +91,9 @@ struct Wizard {
 }
 
 const STEPS: [&str; 5] = ["Welcome", "Folders", "Preferences", "Review", "Done"];
+
+/// Width of the dashboard's action column: the Fix button and the two under it.
+const ACTION_W: f32 = 220.0;
 
 impl App {
     fn new(cc: &eframe::CreationContext) -> Self {
@@ -111,6 +119,7 @@ impl App {
             last_done: None,
             last_ok: true,
             add_path: String::new(),
+            preview: None,
         };
         app.refresh(&cc.egui_ctx);
         app
@@ -137,8 +146,8 @@ impl App {
     /// Bounded to a few seconds so a huge or slow filesystem can never hang the app;
     /// whatever has been found by then is what comes back.
     fn search_computer(&mut self, ctx: &egui::Context) {
-        self.spawn(ctx, t("Searching this computer…"), |_cfg| {
-            Msg::Found(crate::discover::discover_roots(Duration::from_secs(20)))
+        self.spawn(ctx, t("Searching this computer…"), |cfg| {
+            Msg::Found(crate::discover::discover_roots(Duration::from_secs(20), &cfg.ecos()))
         });
     }
 
@@ -149,10 +158,39 @@ impl App {
     fn fix_all(&mut self, ctx: &egui::Context) {
         self.saved_cfg = self.cfg.clone();
         self.first_run = false;
+        self.preview = None;
         self.spawn(ctx, t("Tidying up…"), |cfg| match engine::fix_all(&cfg) {
+            Ok(r) if r.warnings.is_empty() && r.quarantined > 0 => Msg::Done(
+                tf("All tidy! Freed {} · {} recoverable", &[&human(r.freed), &human(r.quarantined)]),
+                true,
+            ),
             Ok(r) if r.warnings.is_empty() => Msg::Done(tf("All tidy! Freed {}", &[&human(r.freed)]), true),
             Ok(r) => Msg::Done(tf("Freed {}, but: {}", &[&human(r.freed), &r.warnings.join("; ")]), false),
             Err(e) => Msg::Done(tf("Something went wrong: {}", &[&e.to_string()]), false),
+        });
+    }
+
+    /// Work out what a clean-up would do, and show it, without touching anything.
+    ///
+    /// This is the button the app never had. "Fix everything" was a leap of faith:
+    /// gigabytes went and the only account of it was a log you read afterwards.
+    fn preview_now(&mut self, ctx: &egui::Context) {
+        self.tab = Tab::Preview;
+        self.spawn(ctx, t("Working out what would go…"), |cfg| {
+            let ecos = cfg.ecos();
+            Msg::Planned(Box::new(engine::plan_all(&cfg, 0, &ecos)))
+        });
+    }
+
+    /// Put back whatever the last clean-up moved aside.
+    fn undo(&mut self, ctx: &egui::Context) {
+        self.spawn(ctx, t("Putting it back…"), |_cfg| match crate::trash::restore(false) {
+            Ok((0, _)) => Msg::Done(t("Nothing to put back").into(), true),
+            Ok((n, bytes)) => {
+                crate::ledger::Ledger::record_restore(bytes);
+                Msg::Done(tf("Put back {} item(s), {}", &[&n.to_string(), &human(bytes)]), true)
+            }
+            Err(e) => Msg::Done(tf("Couldn't put it back: {}", &[&e.to_string()]), false),
         });
     }
 
@@ -169,6 +207,11 @@ impl App {
                     self.saved_cfg.auto_at = at.clone();
                 }
                 self.snap = Some(*s);
+                self.busy = None;
+                self.rx = None;
+            }
+            Ok(Msg::Planned(p)) => {
+                self.preview = Some(*p);
                 self.busy = None;
                 self.rx = None;
             }
@@ -265,6 +308,7 @@ impl eframe::App for App {
                     ui.add_space(10.0);
                     match self.tab {
                         Tab::Insights => self.insights(ui),
+                        Tab::Preview => self.preview_tab(ui, &ctx),
                         Tab::Projects => self.projects(ui, &ctx),
                         Tab::Settings => self.settings(ui, &ctx),
                         Tab::Activity => self.activity(ui),
@@ -321,7 +365,7 @@ impl App {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
-                    ui.set_width((ui.available_width() - 250.0).max(200.0));
+                    ui.set_width((ui.available_width() - ACTION_W - 30.0).max(200.0));
                     match (&self.busy, &self.snap) {
                         (Some(label), _) => {
                             ui.horizontal(|ui| {
@@ -359,23 +403,66 @@ impl App {
                     }
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let enabled = self.busy.is_none() && !self.cfg.roots.is_empty();
-                    if icon_button(
-                        ui,
-                        enabled,
-                        Icon::Sparkle,
-                        t("Fix everything"),
-                        18.0,
-                        if enabled { ACCENT } else { ACCENT_DIM },
-                        Color32::TRANSPARENT,
-                        Color32::WHITE,
-                        vec2(220.0, 56.0),
-                    )
-                    .on_hover_text(t("Share one target folder across projects, build dependencies lean, delete leftover target/ folders, trim caches and turn on daily clean-up."))
-                    .clicked()
-                    {
-                        self.fix_all(ctx);
-                    }
+                    ui.vertical(|ui| {
+                        ui.set_width(ACTION_W);
+                        let enabled = self.busy.is_none() && !self.cfg.roots.is_empty();
+                        if icon_button(
+                            ui,
+                            enabled,
+                            Icon::Sparkle,
+                            t("Fix everything"),
+                            18.0,
+                            if enabled { ACCENT } else { ACCENT_DIM },
+                            Color32::TRANSPARENT,
+                            Color32::WHITE,
+                            vec2(ACTION_W, 56.0),
+                        )
+                        .on_hover_text(t("Share one target folder across projects, build dependencies lean, delete leftover target/ folders, trim caches and turn on daily clean-up."))
+                        .clicked()
+                        {
+                            self.fix_all(ctx);
+                        }
+                        // Secondary, but still buttons: same width and corner as the
+                        // primary one, an outline instead of a fill, and an icon each,
+                        // so they read as actions rather than as two lines of text.
+                        ui.add_space(8.0);
+                        let ready = self.busy.is_none();
+                        if icon_button(
+                            ui,
+                            ready,
+                            Icon::Eye,
+                            t("Preview…"),
+                            14.5,
+                            CARD_HI,
+                            LINE,
+                            if ready { TEXT } else { MUTED },
+                            vec2(ACTION_W, 40.0),
+                        )
+                        .on_hover_text(t("See exactly what would be removed, and remove nothing"))
+                        .clicked()
+                        {
+                            self.preview_now(ctx);
+                        }
+                        if let Some(sum) = self.snap.as_ref().and_then(|s| s.trash_summary.clone()) {
+                            ui.add_space(6.0);
+                            if icon_button(
+                                ui,
+                                ready,
+                                Icon::Undo,
+                                t("Undo last clean-up"),
+                                14.5,
+                                CARD_HI,
+                                LINE,
+                                if ready { TEXT } else { MUTED },
+                                vec2(ACTION_W, 40.0),
+                            )
+                            .on_hover_text(sum)
+                            .clicked()
+                            {
+                                self.undo(ctx);
+                            }
+                        }
+                    });
                 });
             });
         });
@@ -387,9 +474,12 @@ impl App {
         static EMPTY: LazyLock<Snapshot> = LazyLock::new(Snapshot::default);
         let s = self.snap.as_ref().unwrap_or(&EMPTY);
         let ctx = ui.ctx().clone();
-        let w = (ui.available_width() - 3.0 * 12.0) / 4.0;
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 12.0;
+        let avail = ui.available_width();
+        // Below this, four cards each end up too narrow to read their own numbers.
+        let cols = if avail < 820.0 { 2.0 } else { 4.0 };
+        let w = (avail - (cols - 1.0) * 12.0) / cols;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(12.0, 12.0);
             let n = s.targets.iter().filter(|t| !t.keep).count();
             let leftover = anim_bytes(&ctx, "leftover", s.leftover());
             let n_shown = anim_count(&ctx, "leftover_n", n as u64);
@@ -441,13 +531,89 @@ impl App {
                     ui.label(RichText::new(t("Automatic daily clean-up")).size(15.0).strong().color(TEXT));
                     let smart = if self.cfg.smart_schedule && self.cfg.smart { t(" · time picked by AI") } else { "" };
                     let sub = match (scheduled, self.snap.as_ref().and_then(|s| s.last_run.clone())) {
-                        (true, Some(l)) => tf("Every day at {}{} · last: {}", &[&self.cfg.auto_at, smart, &short_log(&l)]),
-                        (true, None) => tf("Every day at {}{} · hasn't run yet", &[&self.cfg.auto_at, smart]),
+                        (true, Some(l)) => tf("Every day at {}{} · last: {}", &[&self.saved_cfg.auto_at, smart, &short_log(&l)]),
+                        (true, None) => tf("Every day at {}{} · hasn't run yet", &[&self.saved_cfg.auto_at, smart]),
                         (false, _) => t("Off — turn on to keep things tidy without thinking about it").into(),
                     };
                     ui.label(RichText::new(sub).color(MUTED));
+                    if scheduled && let Some(next) = crate::schedule::next_run(&self.saved_cfg.auto_at) {
+                        let text = tf("Next run {} · in {}", &[&next.format("%H:%M").to_string(), &until(next)]);
+                        ui.label(RichText::new(text).size(12.5).color(MUTED));
+                        // keep the countdown current without the user touching anything
+                        ctx.request_repaint_after(Duration::from_secs(30));
+                    }
                 });
             });
+            if !scheduled {
+                return;
+            }
+
+            // The task points at a program that's gone (rtidy moved or reinstalled elsewhere).
+            if let Some(gone) = self.snap.as_ref().and_then(|s| s.schedule_broken.clone()) {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    icon_label(
+                        ui,
+                        Icon::Warn,
+                        15.0,
+                        WARN,
+                        RichText::new(tf("The daily clean-up starts {}, which no longer exists", &[&gone.display().to_string()]))
+                            .color(WARN),
+                    );
+                    if ui.add_enabled(self.busy.is_none(), ghost_button(t("Repair"))).clicked() {
+                        self.apply_time(ctx, self.saved_cfg.auto_at.clone(), self.saved_cfg.smart_schedule);
+                    }
+                });
+            }
+
+            // Change the time right here. Edits stay local until Apply, so dragging the
+            // numbers doesn't re-register the task on every frame.
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add_space(52.0);
+                ui.label(RichText::new(t("Time")).color(TEXT));
+                let mut at = self.cfg.auto_at.clone();
+                time_picker(ui, &mut at);
+                self.cfg.auto_at = at;
+                if self.cfg.auto_at != self.saved_cfg.auto_at {
+                    ui.add_space(6.0);
+                    let apply = egui::Button::new(RichText::new(t("Apply")).strong().color(Color32::WHITE)).fill(ACCENT).corner_radius(8);
+                    if ui.add_enabled(self.busy.is_none(), apply).clicked() {
+                        // A time chosen by hand wins over the AI's pick.
+                        self.apply_time(ctx, self.cfg.auto_at.clone(), false);
+                    }
+                    if ui.add(ghost_button(t("Undo"))).clicked() {
+                        self.cfg.auto_at = self.saved_cfg.auto_at.clone();
+                    }
+                }
+            });
+            if self.cfg.smart && self.cfg.smart_schedule && self.cfg.auto_at != self.saved_cfg.auto_at {
+                ui.horizontal(|ui| {
+                    ui.add_space(52.0);
+                    ui.label(RichText::new(t("Setting a time yourself turns off Smart schedule.")).size(12.0).color(MUTED));
+                });
+            }
+        });
+    }
+
+    /// Save a new clean-up time and re-register the task, in the background. Only the
+    /// schedule fields are written, so unsaved edits elsewhere in Settings stay unsaved.
+    fn apply_time(&mut self, ctx: &egui::Context, at: String, smart_schedule: bool) {
+        let mut saved = self.saved_cfg.clone();
+        saved.auto_at = at.clone();
+        saved.smart_schedule = smart_schedule;
+        saved.auto_enabled = true;
+        if let Err(e) = saved.save() {
+            self.toast(tf("Couldn't save: {}", &[&e.to_string()]));
+            return;
+        }
+        self.saved_cfg = saved.clone();
+        self.cfg.auto_at = at;
+        self.cfg.smart_schedule = smart_schedule;
+        self.cfg.auto_enabled = true;
+        self.spawn(ctx, t("Updating schedule…"), move |_| match engine::apply_schedule(&saved) {
+            Ok(()) => Msg::Done(tf("Daily clean-up set to {}", &[&saved.auto_at]), true),
+            Err(e) => Msg::Done(tf("Couldn't change schedule: {}", &[&e.to_string()]), false),
         });
     }
 
@@ -455,6 +621,7 @@ impl App {
         ui.horizontal(|ui| {
             for (tab, name) in [
                 (Tab::Insights, t("Insights")),
+                (Tab::Preview, t("Preview")),
                 (Tab::Projects, t("Projects")),
                 (Tab::Settings, t("Settings")),
                 (Tab::Activity, t("Activity")),
@@ -525,6 +692,122 @@ impl App {
         );
     }
 
+    /// What a clean-up would remove, before it removes it.
+    fn preview_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(plan) = self.preview.take() else {
+            card(CARD).inner_margin(Margin::same(18)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(t("See what a clean-up would remove before anything happens.")).color(MUTED));
+                ui.add_space(10.0);
+                if ui.add_enabled(self.busy.is_none(), ghost_button(t("Work it out"))).clicked() {
+                    self.preview_now(ctx);
+                }
+            });
+            return;
+        };
+        if plan.is_empty() {
+            empty_icon(ui, Icon::Check, GOOD, t("Nothing to clean up right now."));
+            self.preview = Some(plan);
+            return;
+        }
+
+        card(CARD).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                mini(ui, t("Would free"), &human(plan.freed()), TEXT);
+                ui.add_space(28.0);
+                let cost = crate::plan::rebuild_time(plan.rebuild_secs());
+                ui.scope(|ui| mini(ui, t("Costs to rebuild"), &format!("~{cost}"), MUTED))
+                    .response
+                    .on_hover_text(t("Estimated time to produce all of this again, if you need it"));
+                ui.add_space(28.0);
+                let kinds = [
+                    (crate::plan::Kind::Artifact, t("project folders")),
+                    (crate::plan::Kind::Unit, t("build units")),
+                    (crate::plan::Kind::Incremental, t("incremental")),
+                    (crate::plan::Kind::Cache, t("cache entries")),
+                    (crate::plan::Kind::Store, t("store entries")),
+                ];
+                let made_of: Vec<String> = kinds
+                    .iter()
+                    .filter_map(|(k, label)| {
+                        let n = plan.by_kind(*k).count();
+                        (n > 0).then(|| format!("{n} {label}"))
+                    })
+                    .collect();
+                ui.scope(|ui| mini(ui, t("Items"), &plan.actions.len().to_string(), TEXT))
+                    .response
+                    .on_hover_text(made_of.join("\n"));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let b = egui::Button::new(RichText::new(t("Tidy up now")).strong().color(Color32::WHITE))
+                        .fill(ACCENT)
+                        .corner_radius(10)
+                        .min_size(vec2(150.0, 34.0));
+                    if ui.add_enabled(self.busy.is_none(), b).clicked() {
+                        self.fix_all(ctx);
+                    }
+                });
+            });
+            if self.cfg.trash_days > 0 {
+                ui.label(
+                    RichText::new(tf(
+                        "Project folders are moved aside and stay recoverable for {} day(s); caches are removed.",
+                        &[&self.cfg.trash_days.to_string()],
+                    ))
+                    .size(12.0)
+                    .color(MUTED),
+                );
+            }
+        });
+
+        // Per-ecosystem split: with other languages on, this is the answer to "what is
+        // actually filling my disk".
+        if plan.by_eco().len() > 1 {
+            ui.add_space(8.0);
+            card(CARD).inner_margin(Margin::same(12)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                for (id, bytes) in plan.by_eco() {
+                    let label = crate::eco::by_id(&id).map(|e| e.label).unwrap_or("other");
+                    ui.horizontal(|ui| {
+                        dot(ui, ACCENT);
+                        ui.label(RichText::new(label).color(TEXT));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(RichText::new(human(bytes)).color(MUTED));
+                        });
+                    });
+                }
+            });
+        }
+
+        ui.add_space(8.0);
+        card(CARD).inner_margin(Margin::same(10)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            egui::ScrollArea::vertical().max_height(280.0).auto_shrink(false).show(ui, |ui| {
+                for a in plan.actions.iter().take(400) {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([80.0, 18.0], egui::Label::new(RichText::new(human(a.size)).color(TEXT)));
+                        ui.add_sized(
+                            [92.0, 18.0],
+                            egui::Label::new(RichText::new(a.kind.label()).size(12.0).color(MUTED)),
+                        );
+                        ui.label(RichText::new(a.path.display().to_string()).size(12.0).color(MUTED))
+                            .on_hover_text(format!("{}  ·  ~{}s", a.why, a.rebuild_secs.round() as u64));
+                    });
+                }
+            });
+        });
+        if !plan.kept.is_empty() {
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(tf("{} project(s) left alone by their own rules", &[&plan.kept.len().to_string()]))
+                    .size(12.0)
+                    .color(MUTED),
+            )
+            .on_hover_text(plan.kept.iter().take(12).map(|(p, w)| format!("{}  ({w})", p.display())).collect::<Vec<_>>().join("\n"));
+        }
+        self.preview = Some(plan);
+    }
+
     fn projects(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // Moved out of `self` for the frame rather than cloned: the row list can hold
         // hundreds of paths and it was being deep-copied on every repaint.
@@ -544,6 +827,16 @@ impl App {
         }
         let max = s.targets.iter().map(|t| t.size).max().unwrap_or(1).max(1);
         let mut changed = false;
+        // With other languages on, "what is filling my disk" is a per-language question.
+        if s.by_eco.len() > 1 {
+            ui.horizontal_wrapped(|ui| {
+                for (id, bytes) in &s.by_eco {
+                    let label = crate::eco::by_id(id).map(|e| e.label).unwrap_or("other");
+                    chip(ui, &format!("{label}  {}", human(*bytes)), MUTED);
+                }
+            });
+            ui.add_space(6.0);
+        }
         card(CARD).inner_margin(Margin::same(8)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             for (i, row) in s.targets.iter().enumerate() {
@@ -558,7 +851,12 @@ impl App {
                     ui.vertical(|ui| {
                         ui.set_width((ui.available_width() - 540.0).max(150.0));
                         ui.label(RichText::new(&name).strong().color(TEXT));
-                        ui.label(RichText::new(project.display().to_string()).size(12.0).color(MUTED))
+                        let sub = if self.cfg.all_langs {
+                            format!("{}  ·  {}", row.eco_label, project.display())
+                        } else {
+                            project.display().to_string()
+                        };
+                        ui.label(RichText::new(sub).size(12.0).color(MUTED))
                             .on_hover_text(row.path.display().to_string());
                     });
                     let (rect, _) = ui.allocate_exact_size(vec2(100.0, 6.0), Sense::hover());
@@ -566,7 +864,11 @@ impl App {
                     let mut fill = rect;
                     fill.set_width(rect.width() * (row.size as f32 / max as f32).max(0.03));
                     ui.painter().rect_filled(fill, 3.0, if row.keep { MUTED } else { ACCENT });
-                    ui.add_sized([70.0, 20.0], egui::Label::new(RichText::new(human(row.size)).color(TEXT)));
+                    ui.add_sized([70.0, 20.0], egui::Label::new(RichText::new(human(row.size)).color(TEXT)))
+                        .on_hover_text(tf(
+                            "about {} s to build again",
+                            &[&(row.rebuild_secs.round() as u64).to_string()],
+                        ));
                     ui.add_sized(
                         [62.0, 20.0],
                         egui::Label::new(RichText::new(tf("{}d ago", &[&row.age_days.to_string()])).color(MUTED)),
@@ -587,21 +889,78 @@ impl App {
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.add_enabled(!row.keep && self.busy.is_none(), ghost_button(t("Delete"))).clicked() {
-                            let freed = remove_known(&row.path, row.size, false);
-                            self.toast(tf("Deleted {} target ({})", &[&name, &human(freed)]));
+                            // Through the planner, so a folder deleted by hand is as
+                            // recoverable as one the daily run took.
+                            let eco = crate::eco::by_id(row.eco).unwrap_or_else(crate::eco::cargo);
+                            let mut p = crate::plan::Plan::default();
+                            p.push(crate::plan::Action::new(
+                                crate::plan::Kind::Artifact,
+                                row.path.clone(),
+                                row.size,
+                                eco,
+                                row.age_days,
+                                t("removed from the Projects list").into(),
+                            ));
+                            let mode = if self.cfg.trash_days == 0 {
+                                crate::plan::Mode::Delete
+                            } else {
+                                crate::plan::Mode::Trash
+                            };
+                            let out = crate::plan::apply(&p, mode, "gui");
+                            self.toast(match out.quarantined {
+                                0 => tf("Deleted {} ({})", &[&name, &human(out.freed)]),
+                                q => tf("Moved {} aside ({}) — recoverable", &[&name, &human(q)]),
+                            });
                             changed = true;
                         }
                         let mut keep = row.keep;
-                        if ui.checkbox(&mut keep, t("Keep")).on_hover_text(t("Never clean this project")).changed() {
-                            let marker = project.join(crate::targets::KEEP_MARKER);
-                            let _ = if keep { std::fs::write(&marker, "") } else { std::fs::remove_file(&marker) };
-                            changed = true;
+                        if let Some(from) = &row.rules_from {
+                            ui.label(RichText::new("•").size(12.0).color(AI))
+                                .on_hover_text(tf("rules from {}", &[&from.display().to_string()]));
+                        }
+                        if ui.checkbox(&mut keep, t("Keep")).on_hover_text(t("Never clean this project — written to .rtidy.toml, so it travels with the repository")).changed() {
+                            match crate::rules::Rules::set_keep(project, keep) {
+                                Ok(()) => changed = true,
+                                Err(e) => self.toast(tf("Couldn't write .rtidy.toml: {}", &[&e.to_string()])),
+                            }
                         }
                     });
                 });
             }
         });
         changed
+    }
+
+    /// One click for all eight thresholds. Nothing is saved here: it fills the fields
+    /// below, which the person can then adjust and save like any other change.
+    fn preset_row(&mut self, ui: &mut egui::Ui) {
+        // The id is copied out before the loop, so the buttons can write to `self.cfg`.
+        let now = crate::preset::current(&self.cfg).map(|p| p.id);
+        let mut picked: Option<&'static crate::preset::Preset> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+            for p in crate::preset::ALL.iter() {
+                let active = now == Some(p.id);
+                let b = egui::Button::new(
+                    RichText::new(p.label()).color(if active { Color32::WHITE } else { TEXT }),
+                )
+                .fill(if active { ACCENT } else { CARD_HI })
+                .stroke(Stroke::NONE)
+                .corner_radius(10)
+                .min_size(vec2(132.0, 32.0));
+                if ui.add(b).on_hover_text(p.detail()).clicked() {
+                    picked = Some(p);
+                }
+            }
+        });
+        let note = match now.and_then(crate::preset::by_id) {
+            Some(p) => p.detail().to_string(),
+            None => t("Your own settings — pick a preset to start from one of these instead.").to_string(),
+        };
+        ui.label(RichText::new(note).size(12.0).color(MUTED));
+        if let Some(p) = picked {
+            self.cfg = p.over(&self.cfg);
+        }
     }
 
     fn settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -648,6 +1007,72 @@ impl App {
             self.path_input(ui);
 
             ui.add_space(16.0);
+            section(
+                ui,
+                t("Other languages (extra)"),
+                t("rtidy is a Rust tool. Switch this on and it also cleans other languages' build output."),
+            );
+            option_row(
+                ui,
+                &mut self.cfg.all_langs,
+                t("Clean other languages too"),
+                t("node_modules, .gradle, __pycache__, bin/obj, Unity Library and the rest"),
+            );
+            if self.cfg.all_langs {
+                ui.add_space(4.0);
+                let mut off = self.cfg.ecos_off.clone();
+                egui::Grid::new("ecos").num_columns(3).spacing([18.0, 4.0]).show(ui, |ui| {
+                    for (i, e) in crate::eco::ALL.iter().enumerate().filter(|(_, e)| e.id != "cargo") {
+                        let mut on = !off.iter().any(|o| o == e.id);
+                        if ui.checkbox(&mut on, e.label).changed() {
+                            if on {
+                                off.retain(|o| o != e.id);
+                            } else {
+                                off.push(e.id.to_string());
+                            }
+                        }
+                        if i % 3 == 0 {
+                            ui.end_row();
+                        }
+                    }
+                });
+                self.cfg.ecos_off = off;
+                slider(ui, t("Package stores: drop entries untouched for (0 = keep)"), &mut self.cfg.store_days, 0..=730, t("days"));
+                if let Some(stores) = self.snap.as_ref().map(|s| s.stores.clone())
+                    && !stores.is_empty()
+                {
+                    for (label, path, size) in stores.iter().take(8) {
+                        ui.horizontal(|ui| {
+                            dot(ui, MUTED);
+                            ui.label(RichText::new(format!("{label}  {}", human(*size))).size(12.5).color(TEXT))
+                                .on_hover_text(path.display().to_string());
+                        });
+                    }
+                }
+                ui.label(
+                    RichText::new(t("Package stores (npm, Gradle, Maven, NuGet, Go, pip) are already shared per user. rtidy trims them and never moves them."))
+                        .size(12.0)
+                        .color(MUTED),
+                );
+            }
+
+            ui.add_space(16.0);
+            section(ui, t("Undo"), t("How long a clean-up can be taken back"));
+            slider(ui, t("Keep deleted project folders recoverable for"), &mut self.cfg.trash_days, 0..=30, t("days"));
+            ui.label(
+                RichText::new(match self.cfg.trash_days {
+                    0 => t("0 means deleted outright, with no way back.").to_string(),
+                    _ => t("They are moved aside on the same drive, so the space comes back when they are purged.").to_string(),
+                })
+                .size(12.0)
+                .color(MUTED),
+            );
+
+            ui.add_space(16.0);
+            section(ui, t("Presets"), t("One click sets every limit below; adjust anything afterwards"));
+            self.preset_row(ui);
+
+            ui.add_space(16.0);
             section(ui, t("Clean-up rules"), t("Limits that always apply, with or without AI"));
             slider(ui, t("Delete project target/ not built for"), &mut self.cfg.days, 0..=180, t("days"));
             slider(ui, t("Shared folder: drop artifacts unused for"), &mut self.cfg.gc_days, 1..=90, t("days"));
@@ -656,11 +1081,15 @@ impl App {
             option_row(ui, &mut self.cfg.lean, t("Lean builds"), t("Dependencies without debug info (your own code keeps it)"));
             ui.horizontal(|ui| {
                 ui.label(RichText::new(t("Daily clean-up time")).color(TEXT));
-                ui.add_enabled(
-                    !(self.cfg.smart && self.cfg.smart_schedule),
-                    egui::TextEdit::singleline(&mut self.cfg.auto_at).desired_width(60.0),
-                );
+                ui.add_space(6.0);
+                if time_picker(ui, &mut self.cfg.auto_at) {
+                    // a time picked by hand wins over the AI's pick
+                    self.cfg.smart_schedule = false;
+                }
             });
+            if self.cfg.smart && self.cfg.smart_schedule {
+                ui.label(RichText::new(t("Smart schedule picks this time for you. Setting one yourself turns it off.")).size(12.0).color(MUTED));
+            }
 
             ui.add_space(14.0);
             let dirty = self.cfg != self.saved_cfg;
@@ -672,12 +1101,20 @@ impl App {
                 if ui.add_enabled(dirty, b).clicked() {
                     match self.cfg.save() {
                         Ok(()) => {
+                            let time_changed = self.cfg.auto_at != self.saved_cfg.auto_at;
                             self.saved_cfg = self.cfg.clone();
-                            self.toast(t("Settings saved"));
                             if self.snap.as_ref().is_some_and(|s| s.scheduled) {
-                                let _ = engine::apply_schedule(&self.cfg);
+                                // Re-registering the task takes a moment: do it off the UI
+                                // thread, and report a failure instead of dropping it.
+                                self.spawn(ctx, t("Updating schedule…"), move |cfg| match engine::apply_schedule(&cfg) {
+                                    Ok(()) if time_changed => Msg::Done(tf("Settings saved · daily clean-up at {}", &[&cfg.auto_at]), true),
+                                    Ok(()) => Msg::Done(t("Settings saved").into(), true),
+                                    Err(e) => Msg::Done(tf("Settings saved, but the schedule couldn't change: {}", &[&e.to_string()]), false),
+                                });
+                            } else {
+                                self.toast(t("Settings saved"));
+                                self.refresh(ctx);
                             }
-                            self.refresh(ctx);
                         }
                         Err(e) => self.toast(tf("Couldn't save: {}", &[&e.to_string()])),
                     }
@@ -695,6 +1132,49 @@ impl App {
     }
 
     fn activity(&self, ui: &mut egui::Ui) {
+        if let Some(s) = self.snap.as_ref()
+            && s.ledger.net() > 0
+        {
+            card(CARD).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    mini(ui, t("Freed in total"), &human(s.ledger.net()), GOOD);
+                    ui.add_space(28.0);
+                    if let Some(d) = s.ledger.days() {
+                        mini(ui, t("Since"), &tf("{} days ago", &[&d.to_string()]), TEXT);
+                        ui.add_space(28.0);
+                    }
+                    if let Some(per) = s.ledger.per_day() {
+                        mini(ui, t("Per day"), &human(per as u64), TEXT);
+                        ui.add_space(28.0);
+                    }
+                    mini(ui, t("Runs"), &s.ledger.runs.len().to_string(), MUTED);
+                });
+                let top = s.ledger.top_ecos();
+                if top.len() > 1 {
+                    ui.add_space(8.0);
+                    for (id, bytes) in top.iter().take(6) {
+                        let label = crate::eco::by_id(id).map(|e| e.label).unwrap_or("other");
+                        ui.horizontal(|ui| {
+                            dot(ui, ACCENT);
+                            ui.label(RichText::new(label).size(13.0).color(TEXT));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(RichText::new(human(*bytes)).size(13.0).color(MUTED));
+                            });
+                        });
+                    }
+                }
+                if s.trash_size > 0 {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(tf("{} is still recoverable (Undo on the dashboard)", &[&human(s.trash_size)]))
+                            .size(12.0)
+                            .color(MUTED),
+                    );
+                }
+            });
+            ui.add_space(10.0);
+        }
         card(CARD).inner_margin(Margin::same(14)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             if self.log.is_empty() {
@@ -892,7 +1372,9 @@ impl App {
     fn w_prefs(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new(t("How tidy should it be?")).size(22.0).strong().color(TEXT));
         ui.label(RichText::new(t("The defaults are good for most people.")).color(MUTED));
-        ui.add_space(16.0);
+        ui.add_space(14.0);
+        self.preset_row(ui);
+        ui.add_space(14.0);
         let mech = crate::schedule::mechanism();
         option_row(ui, &mut self.cfg.smart, t("Smart mode (AI)"), t("Learns what you reuse; cleans harder only when the disk is filling up"));
         option_row(ui, &mut self.cfg.lean, t("Lean builds"), t("Build dependencies without debug info"));
@@ -920,8 +1402,11 @@ impl App {
                 }
                 if !(self.cfg.smart && self.cfg.smart_schedule) {
                     ui.label(RichText::new(t("at")).color(MUTED));
-                    ui.add(egui::TextEdit::singleline(&mut self.cfg.auto_at).desired_width(60.0));
+                    time_picker(ui, &mut self.cfg.auto_at);
                 }
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(56.0);
                 ui.label(RichText::new(t("if the computer is off, it runs at next start-up")).size(12.0).color(MUTED));
             });
             ui.add_space(8.0);
@@ -1302,6 +1787,53 @@ fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     resp
 }
 
+/// Hour and minute boxes (drag, scroll, arrow keys, or click and type) plus a few
+/// one-click presets. `at` always holds a valid HH:MM afterwards, so a typo can no
+/// longer reach the scheduler. Returns true when the user changed the time.
+fn time_picker(ui: &mut egui::Ui, at: &mut String) -> bool {
+    let (mut h, mut m) = crate::schedule::parse_at(at).unwrap_or((12, 30));
+    let before = (h, m);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let two = |n: f64, _| format!("{:02}", n as u32);
+        // The default drag box is sized for a line of body text, which left two digits
+        // in a target smaller than the pointer. These are the control: give them room.
+        ui.scope(|ui| {
+            ui.spacing_mut().interact_size = vec2(54.0, 36.0);
+            ui.spacing_mut().button_padding = vec2(10.0, 8.0);
+            ui.style_mut().text_styles.insert(egui::TextStyle::Button, FontId::proportional(18.0));
+            ui.add(egui::DragValue::new(&mut h).range(0..=23).speed(0.08).custom_formatter(two))
+                .on_hover_text(t("Hour (0-23): drag, scroll, or click to type"));
+            ui.label(RichText::new(":").size(18.0).strong().color(TEXT));
+            ui.add(egui::DragValue::new(&mut m).range(0..=59).speed(0.15).custom_formatter(two))
+                .on_hover_text(t("Minute (0-59): drag, scroll, or click to type"));
+        });
+        ui.add_space(10.0);
+        for (label, ph, pm) in [(t("Night"), 3, 0), (t("Lunch"), 12, 30), (t("Evening"), 18, 0)] {
+            let text = RichText::new(format!("{label} {ph:02}:{pm:02}")).size(13.0).color(TEXT);
+            let b = egui::Button::new(text)
+                .fill(CARD_HI)
+                .stroke(Stroke::new(1.0_f32, LINE))
+                .corner_radius(10)
+                .min_size(vec2(0.0, 34.0));
+            if ui.add(b).clicked() {
+                (h, m) = (ph, pm);
+            }
+        }
+    });
+    *at = format!("{h:02}:{m:02}");
+    (h, m) != before
+}
+
+/// "in 5 h 20 min" / "in 12 min" until `next`.
+fn until(next: chrono::DateTime<chrono::Local>) -> String {
+    let mins = (next - chrono::Local::now()).num_minutes().max(0);
+    match (mins / 60, mins % 60) {
+        (0, m) => tf("{} min", &[&m.to_string()]),
+        (h, m) => tf("{} h {} min", &[&h.to_string(), &m.to_string()]),
+    }
+}
+
 fn short_log(l: &str) -> String {
     // "2026-11-21T16:09:52Z auto: freed 6.2 MB total" -> "2026-11-21 · freed 6.2 MB"
     let date = l.get(..10).unwrap_or("");
@@ -1334,6 +1866,10 @@ pub enum Icon {
     Warn,
     /// Circular arrow: rescan (was ⟳)
     Refresh,
+    /// An eye: see what would happen before it happens.
+    Eye,
+    /// An arrow turning back on itself: undo.
+    Undo,
 }
 
 /// Convex quad through four unit-square points.
@@ -1395,6 +1931,48 @@ pub fn paint_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: 
             shapes.push(egui::Shape::line_segment([at(0.50, 0.38), at(0.50, 0.62)], s));
             shapes.push(egui::Shape::circle_filled(at(0.50, 0.75), w * 0.055, color));
         }
+        Icon::Eye => {
+            // An almond outline with a pupil: two arcs meeting at the corners.
+            let s = Stroke::new(w * 0.10, color);
+            let lid = |up: f32| -> Vec<egui::Pos2> {
+                (0..=20)
+                    .map(|i| {
+                        let x = 0.08 + 0.84 * i as f32 / 20.0;
+                        // a parabola through both corners, bulging by `up` in the middle
+                        let k = (x - 0.08) * (0.92 - x) / 0.1764;
+                        at(x, 0.5 - up * k)
+                    })
+                    .collect()
+            };
+            shapes.push(egui::Shape::line(lid(0.30), s));
+            shapes.push(egui::Shape::line(lid(-0.30), s));
+            shapes.push(egui::Shape::circle_filled(at(0.5, 0.5), w * 0.13, color));
+        }
+        Icon::Undo => {
+            // An arrow that curves back to the left, over the top.
+            let s = Stroke::new(w * 0.11, color);
+            let (cx, cy, rad) = (0.52, 0.56, 0.32);
+            let arc: Vec<egui::Pos2> = (0..=24)
+                .map(|i| {
+                    // from just past the left, over the top, round to the right
+                    let t = std::f32::consts::TAU * (0.5 - 0.72 * i as f32 / 24.0);
+                    at(cx + rad * t.cos(), cy + rad * t.sin())
+                })
+                .collect();
+            shapes.push(egui::Shape::line(arc, s));
+            // Head at the left end, pointing down into the curve.
+            let a = 0.15;
+            shapes.push(quad(
+                r,
+                [
+                    (cx - rad - a * 0.9, cy - a * 0.2),
+                    (cx - rad + a * 0.9, cy - a * 0.2),
+                    (cx - rad, cy + a * 1.2),
+                    (cx - rad, cy + a * 1.2),
+                ],
+                color,
+            ));
+        }
         Icon::Refresh => {
             // Open circle with an arrow head on the end, swept clockwise.
             let s = Stroke::new(w * 0.11, color);
@@ -1440,6 +2018,17 @@ fn icon_label(ui: &mut egui::Ui, icon: Icon, size: f32, icon_color: Color32, tex
 }
 
 /// A chip with a painted icon before its label.
+/// A small rounded tag: a label on a tinted background.
+fn chip(ui: &mut egui::Ui, text: &str, color: Color32) {
+    Frame::new()
+        .fill(color.linear_multiply(0.14))
+        .corner_radius(8)
+        .inner_margin(Margin::symmetric(8, 2))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).size(11.5).color(color));
+        });
+}
+
 fn chip_icon(ui: &mut egui::Ui, icon: Icon, text: &str, color: Color32) {
     Frame::new()
         .fill(color.linear_multiply(0.18))
@@ -1554,4 +2143,54 @@ fn sweep_bar(ui: &mut egui::Ui, width: f32) {
     );
     painter.rect_filled(lozenge, 2.0, ACCENT);
     ui.ctx().request_repaint();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Draw `time_picker` once in a headless egui frame.
+    fn pick(start: &str) -> (String, bool) {
+        let ctx = egui::Context::default();
+        let mut at = start.to_string();
+        let mut changed = false;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            changed = time_picker(ui, &mut at);
+        });
+        // nothing renders here, so the font texture upload is dropped on purpose
+        out.textures_delta.clear();
+        (at, changed)
+    }
+
+    #[test]
+    fn time_picker_keeps_a_valid_time() {
+        assert_eq!(pick("03:17"), ("03:17".into(), false));
+        assert_eq!(pick("00:00"), ("00:00".into(), false));
+        assert_eq!(pick("23:59"), ("23:59".into(), false));
+    }
+
+    #[test]
+    fn time_picker_normalises_loose_input_without_calling_it_a_change() {
+        assert_eq!(pick("7:5"), ("07:05".into(), false));
+        assert_eq!(pick(" 9:30 "), ("09:30".into(), false));
+    }
+
+    #[test]
+    fn time_picker_never_lets_an_invalid_time_through() {
+        for bad in ["25:99", "abc", "", "12:60", "-1:00"] {
+            let (at, _) = pick(bad);
+            assert!(crate::schedule::parse_at(&at).is_ok(), "{bad:?} became {at:?}");
+            assert_eq!(at, "12:30");
+        }
+    }
+
+    #[test]
+    fn countdown_text() {
+        crate::i18n::set(Lang::En);
+        let soon = chrono::Local::now() + chrono::Duration::minutes(12) + chrono::Duration::seconds(30);
+        assert_eq!(until(soon), "12 min");
+        let later = chrono::Local::now() + chrono::Duration::minutes(5 * 60 + 20) + chrono::Duration::seconds(30);
+        assert_eq!(until(later), "5 h 20 min");
+        assert_eq!(until(chrono::Local::now() - chrono::Duration::minutes(3)), "0 min");
+    }
 }

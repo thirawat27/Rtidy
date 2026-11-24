@@ -34,6 +34,105 @@ and rtidy uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   catch up on this system, when it last finished and when it runs next. It, and
   `rtidy doctor`, warn when the task points at a copy of rtidy that no longer exists.
 - Catch-up runs say so in the log.
+- **Pick the clean-up time yourself in the app.** The dashboard card, Settings and
+  the setup wizard have an hour and minute picker (drag, scroll or type) with
+  one-click presets (night 03:00, lunch 12:30, evening 18:00). The dashboard applies
+  the new time without a trip to Settings, and shows when the next run is and how
+  long until then. Setting a time by hand turns Smart schedule off, and the app says
+  so; before, the time box was greyed out whenever Smart schedule was on.
+- The dashboard warns when the daily task starts a copy of rtidy that no longer
+  exists, with a one-click **Repair**.
+- **Preview, then clean.** Nothing is removed on the spot any more. A clean-up first
+  builds a plan — every action with its size, age, reuse chance, estimated rebuild
+  seconds and a reason — and `plan::apply` is now the only code in rtidy that removes
+  anything. The app has a **Preview** tab and a *Preview…* button on the dashboard
+  showing what would go, the total, the estimated rebuild time and a breakdown per
+  language and per kind, with a *Tidy up now* button. `rtidy plan [folders] [--days N]
+  [--json]` prints the same plan in the terminal and removes nothing.
+- **Undo.** Project build folders are no longer unlinked: they are renamed into a
+  `.rtidy-trash` folder at the top of the same drive (the same filesystem, so the move
+  is instant whatever the size) and recorded in an index, and `rtidy undo [--all]`, or
+  *Undo last clean-up* in the app, puts the last run back. Entries older than
+  `trash_days` — 3 days by default, 0–30 in Settings, 0 to delete outright — are purged
+  at the start of every clean-up, which is when the space is actually handed back.
+  Caches and build units are not quarantined: they re-download or rebuild themselves,
+  and keeping copies would hold space back for nothing. A scheduled run on a critically
+  full disk deletes outright instead, and says so. `rtidy trash [--empty]` shows what is
+  recoverable, and for how long.
+- **Other languages, as an opt-in extra.** rtidy stays a Rust tool: Cargo is always on
+  and remains the only ecosystem with the prevention trick behind it, one shared target
+  folder. A single switch in Settings, **Other languages (extra)**, adds 16 more to the
+  same scan, preview, undo and daily run: Node (`node_modules`, `.next`, `.nuxt`,
+  `.turbo`, `.svelte-kit`, `.parcel-cache`), Python, .NET, Gradle, Maven, Go, CMake,
+  Unity, Unreal, Godot, Zig, Elixir, Swift, Haskell, Dart/Flutter and PHP/Composer. Each
+  is identified by the manifest beside the build folder, so `target/` is Cargo next to a
+  `Cargo.toml` and Maven next to a `pom.xml`, and a folder called `build` with no
+  manifest beside it is never touched. Individual languages can be ticked off in
+  Settings or with `rtidy langs --on <id>`, `--off <id>`, `--rust-only`; `rtidy langs`
+  lists them.
+- **Package stores.** npm, pnpm, yarn, pip, uv, Gradle, Maven, NuGet, Go (build and
+  module cache), Hex, pub, Composer and Zig are already shared per user, so there is
+  nothing to prevent there — what they do is grow forever. rtidy finds them, measures
+  them and trims entries untouched for `store_days` (120 days by default) through
+  `rtidy stores [--days N] [--dry-run]`. It deliberately never relocates them: those are
+  environment variables (`GOCACHE`, `GRADLE_USER_HOME`, `NUGET_PACKAGES`) read by
+  shells, CI jobs and IDEs, so `rtidy doctor` prints the variable and leaves the decision
+  to the user.
+- **Ranked by what it costs to rebuild**, not by size. The plan is ordered by bytes freed
+  per second of rebuilding, discounted by the model's reuse chance, so a big folder that
+  takes twenty minutes to produce again ranks below a slightly smaller one that takes
+  five seconds. Every row in the Projects tab and in the preview shows its estimated
+  rebuild time.
+- **Watch mode.** `rtidy watch [--once]` polls the shared target folder and trims
+  incremental caches, and enforces the size cap, once building has stopped for
+  `watch_idle_mins` (10 by default), instead of waiting for the daily run. It never
+  removes a project's own build folders; those stay with the daily run and the app.
+- **Per-repository rules.** A committed `.rtidy.toml` beside the manifest can say
+  `keep = true`, `days = 90`, `trash_days = 7`, `all_langs = true` and
+  `except = [".venv"]`. The app's *Keep* checkbox writes it, so the rule travels with the
+  repository; the older empty `.rtidy-keep` marker still works and still means
+  `keep = true`. The preview lists what was left alone and why.
+- **For CI and teams.** `rtidy plan --json` prints the whole plan as JSON, and
+  `rtidy budget 50G [folders]` frees the cheapest set of things needed to reach that much
+  free space, exiting with code 3 if it cannot get there.
+- **Savings history.** Every run records what it freed, per ecosystem. The app's
+  **Activity** tab shows the all-time total, the days since the first run, the average
+  per day, how many runs there have been and the split per language. Anything restored is
+  subtracted again, so the figure stays honest.
+- `rtidy gc` uses the model to decide which build units are not coming back when Smart
+  mode is on, rather than age alone. Hard limits from Settings still apply.
+- **Presets.** Settings holds eight thresholds, each a real trade-off, which is fine for
+  someone tuning it and no help to someone who just knows their laptop is full. Five
+  ready-made answers — **Careful**, **Balanced** (the shipped default), **Small disk**,
+  **Workstation** and **CI runner** — set all of them at once, from Settings, from the
+  setup wizard, or with `rtidy preset <name>`; `rtidy preset` lists them and says which
+  one the current settings match, and `--dry-run` prints the changes line by line. A
+  preset never touches the project folders, the app's language, the clean-up time, or the
+  **Other languages** switch and the ecosystems under it — that switch widens what rtidy
+  may delete rather than how eagerly, so nothing but the person turns it on. Adjusting
+  anything afterwards simply means no preset is selected any more.
+- **CI keeps less behind.** A build used to upload its logs and every installer with
+  GitHub's default 90-day retention, on every push and every pull request, and each
+  branch wrote its own copy of the Rust cache. Retention is now a week for logs and a
+  fortnight for installers (a day on pull requests), the installers are deleted as soon
+  as a release carries them, pull requests restore the cache without writing a new one,
+  a new push to a pull request cancels the run it supersedes, and a closed pull
+  request's caches are removed on the spot. `tidy up after the build` can also be run by
+  hand to clear artifacts older than a chosen age. The workflow's default permissions
+  dropped to read-only, with write granted to the two jobs that need it.
+- `RTIDY_HOME` puts everything rtidy remembers — settings, the model, the trash index,
+  the savings history and the run log — in one folder of your choosing. The per-user
+  config directory is resolved through the OS (the Known Folder API on Windows), so no
+  environment variable could redirect it, which meant rtidy could not be exercised by a
+  test, in CI, or by anyone trying it out, without writing over the real settings of
+  whoever ran it.
+
+### Fixed (app)
+
+- A mistyped time such as `25:99` could be saved, and the schedule then failed
+  silently. The picker only produces valid times.
+- Saving Settings no longer freezes the window while the task is re-registered, and
+  a failure to update the schedule is shown instead of being ignored.
 
 ## [1.0.0] — 2026-11-22
 

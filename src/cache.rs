@@ -1,6 +1,7 @@
 //! ~/.cargo download caches: extracted sources, .crate archives, git checkouts.
 //! Everything here is re-downloaded or re-extracted on demand, so it is safe to drop.
 
+use crate::plan::{Action, Kind, Plan};
 use crate::say;
 use crate::util::*;
 use anyhow::Result;
@@ -42,58 +43,70 @@ fn stale(entries: impl Iterator<Item = fs::DirEntry>, days: u64) -> Vec<(PathBuf
         .collect()
 }
 
-/// Deleting is I/O-bound and the entries are independent, so run them in parallel.
-fn drop_all(victims: Vec<(PathBuf, Option<u64>)>, dry_run: bool) -> u64 {
+/// Turn candidates into plan actions, measuring the directories among them in parallel
+/// (a `.crate` archive already reported its size; an extracted source tree has to be
+/// walked, and there are thousands of them).
+fn actions(victims: Vec<(PathBuf, Option<u64>)>, days: u64) -> Vec<Action> {
+    let why = crate::i18n::tf("downloaded, unused for {} days", &[&days.to_string()]);
     victims
         .into_par_iter()
-        .map(|(p, size)| match size {
-            Some(s) => remove_known(&p, s, dry_run),
-            None => remove(&p, dry_run),
+        .map(|(p, size)| {
+            let size = size.unwrap_or_else(|| dir_size(&p));
+            let age = fs::metadata(&p).map(|m| age_days(mtime_of(&m))).unwrap_or(days);
+            Action::new(Kind::Cache, p, size, crate::eco::cargo(), age, why.clone())
         })
-        .sum()
+        .collect()
 }
 
-/// Remove entries two levels down (`<dir>/<index>/<entry>`) older than `days`.
-fn prune_level2(dir: &Path, days: u64, dry_run: bool) -> u64 {
-    let victims: Vec<_> = fs::read_dir(dir)
+/// Candidates two levels down (`<dir>/<index>/<entry>`) older than `days`.
+fn stale_level2(dir: &Path, days: u64) -> Vec<(PathBuf, Option<u64>)> {
+    fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
         .flat_map(|idx| stale(fs::read_dir(idx.path()).into_iter().flatten().flatten(), days))
-        .collect();
-    drop_all(victims, dry_run)
+        .collect()
 }
 
-fn prune_level1(dir: &Path, days: u64, dry_run: bool) -> u64 {
-    drop_all(stale(fs::read_dir(dir).into_iter().flatten().flatten(), days), dry_run)
+fn stale_level1(dir: &Path, days: u64) -> Vec<(PathBuf, Option<u64>)> {
+    stale(fs::read_dir(dir).into_iter().flatten().flatten(), days)
 }
 
-pub fn clean(days: u64, dry_run: bool) -> Result<u64> {
+/// What a cache clean-up would remove, without removing it.
+pub fn clean_plan(days: u64) -> Result<Plan> {
     let h = cargo_home()?;
     let reg = h.join("registry");
     let git = h.join("git");
     let ((src, crates), (checkouts, db)) = rayon::join(
         || {
             rayon::join(
-                || prune_level2(&reg.join("src"), days, dry_run),
-                || prune_level2(&reg.join("cache"), days, dry_run),
+                || stale_level2(&reg.join("src"), days),
+                || stale_level2(&reg.join("cache"), days),
             )
         },
         || {
             rayon::join(
-                || prune_level2(&git.join("checkouts"), days, dry_run),
-                || prune_level1(&git.join("db"), days, dry_run),
+                || stale_level2(&git.join("checkouts"), days),
+                || stale_level1(&git.join("db"), days),
             )
         },
     );
-    let total = src + crates + checkouts + db;
+    let mut all = src;
+    all.extend(crates);
+    all.extend(checkouts);
+    all.extend(db);
+    Ok(Plan { actions: actions(all, days), kept: Vec::new() })
+}
+
+pub fn clean(days: u64, dry_run: bool) -> Result<u64> {
+    let plan = clean_plan(days)?;
+    let mode = if dry_run { crate::plan::Mode::Preview } else { crate::plan::Mode::Delete };
+    let out = crate::plan::apply(&plan, mode, "cache");
     say!(
-        "cargo cache: {} {} (sources {}, .crate {}, git {})",
+        "cargo cache: {} {} ({} entries)",
         if dry_run { "would free" } else { "freed" },
-        human(total),
-        human(src),
-        human(crates),
-        human(checkouts + db)
+        human(out.freed),
+        out.done
     );
-    Ok(total)
+    Ok(out.freed)
 }

@@ -88,9 +88,7 @@ macro_rules! say {
 }
 
 pub fn log_path() -> Result<PathBuf> {
-    let dir = dirs::cache_dir().context("no cache dir")?.join("rtidy");
-    fs::create_dir_all(&dir)?;
-    Ok(dir.join("rtidy.log"))
+    Ok(crate::config::cache_dir()?.join("rtidy.log"))
 }
 
 /// Total bytes of a directory tree.
@@ -127,14 +125,6 @@ fn walk_size(p: &Path) -> u64 {
         .sum()
 }
 
-pub fn size_of(p: &Path) -> u64 {
-    if p.is_dir() {
-        dir_size(p)
-    } else {
-        fs::metadata(p).map(|m| m.len()).unwrap_or(0)
-    }
-}
-
 /// Modified time from metadata already in hand, so callers that read an entry's
 /// metadata for its size don't pay a second `stat` for its age.
 pub fn mtime_of(md: &fs::Metadata) -> SystemTime {
@@ -145,15 +135,12 @@ pub fn age_days(t: SystemTime) -> u64 {
     SystemTime::now().duration_since(t).unwrap_or_default().as_secs() / 86_400
 }
 
-/// Delete a file or folder; returns bytes freed (0 on failure, e.g. locked by a running build).
+/// Delete a file or folder whose size is already known; returns bytes freed (0 on
+/// failure, e.g. locked by a running build).
 ///
-/// Prefer `remove_known` wherever the size is already at hand: measuring a tree costs a
-/// full recursive walk, and every caller that scanned the folder first already has it.
-pub fn remove(p: &Path, dry_run: bool) -> u64 {
-    remove_known(p, size_of(p), dry_run)
-}
-
-/// `remove` for callers that already measured `p`, skipping the pre-delete walk.
+/// There is no measure-then-delete variant on purpose: every caller got here from a
+/// scan that measured the tree already, and `crate::plan::Plan` carries that size, so a
+/// second recursive walk at delete time would be pure waste.
 pub fn remove_known(p: &Path, size: u64, dry_run: bool) -> u64 {
     if dry_run {
         return size;
@@ -316,12 +303,12 @@ c
         fs::write(tree.join("a.bin"), vec![0u8; 3000]).unwrap();
         fs::write(tree.join("sub/b.bin"), vec![0u8; 1500]).unwrap();
 
-        let measured = size_of(&tree);
+        let measured = dir_size(&tree);
         assert_eq!(measured, 4500);
         // Dry run reports the size without touching anything.
         assert_eq!(remove_known(&tree, measured, true), measured);
         assert!(tree.exists());
-        // And the real delete reports the same number `remove` would have walked for.
+        // And the real delete reports the same number the scan measured.
         assert_eq!(remove_known(&tree, measured, false), measured);
         assert!(!tree.exists());
 

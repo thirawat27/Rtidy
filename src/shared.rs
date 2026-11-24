@@ -1,5 +1,6 @@
 //! The shared target dir: set it up, keep it small, slim down debug info.
 
+use crate::plan::{Action, Kind, Plan};
 use crate::say;
 use crate::util::*;
 use anyhow::{Context, Result};
@@ -180,22 +181,36 @@ pub fn profiles(shared: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// AI-guided shrink: evict the build units the model thinks you won't reuse, stricter
-/// (and with a lower size cap) as disk pressure rises. Hard limits still apply.
-pub fn smart_gc(cfg: &crate::config::Config, b: &crate::brain::Brain, now: i64, dry_run: bool) -> Result<u64> {
+/// Incremental caches inside the shared dir, as plan actions.
+///
+/// Incremental data is the compiler's own scratch space: it makes the *next* build of
+/// something you are actively working on faster and is worth nothing once you have
+/// moved on, which is why it goes in every plan, whatever the ages elsewhere say.
+fn incremental_actions(shared: &Path) -> Vec<Action> {
+    let dirs: Vec<PathBuf> = profiles(shared).into_iter().map(|p| p.join("incremental")).filter(|p| p.is_dir()).collect();
+    dirs.into_par_iter()
+        .map(|p| {
+            let size = dir_size(&p);
+            let age = age_days(crate::util::mtime_of(&fs::metadata(&p).ok()?));
+            Some(Action::new(Kind::Incremental, p, size, crate::eco::cargo(), age, crate::i18n::t("incremental cache").into()))
+        })
+        .flatten()
+        .collect()
+}
+
+/// AI-guided shrink, as a plan: evict the build units the model thinks you won't reuse,
+/// stricter (and with a lower size cap) as disk pressure rises. Hard limits still apply.
+pub fn smart_gc_plan(cfg: &crate::config::Config, b: &crate::brain::Brain, now: i64) -> Result<Plan> {
+    let mut plan = Plan::default();
     let Some(shared) = shared_target_dir()? else {
         say!("gc: no shared target dir (run `rtidy setup`), skipping");
-        return Ok(0);
+        return Ok(plan);
     };
     if !shared.is_dir() {
-        return Ok(0);
+        return Ok(plan);
     }
-    let mut freed = 0;
-    for p in profiles(&shared) {
-        let inc = p.join("incremental");
-        if inc.is_dir() {
-            freed += remove(&inc, dry_run);
-        }
+    for a in incremental_actions(&shared) {
+        plan.push(a);
     }
     let free = free_space(&shared);
     let pressure = b.pressure(free);
@@ -208,7 +223,6 @@ pub fn smart_gc(cfg: &crate::config::Config, b: &crate::brain::Brain, now: i64, 
     let mut scored: Vec<(f64, &crate::brain::Group)> = groups.iter().map(|g| (b.artifact_reuse(g, now), g)).collect();
     scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
     let mut current: u64 = groups.iter().map(|g| g.size).sum();
-    let mut units = 0;
     for (p, g) in scored {
         let age = ((now - g.last_use) as f64 / 86_400.0).max(0.0);
         if age < min_age {
@@ -218,71 +232,81 @@ pub fn smart_gc(cfg: &crate::config::Config, b: &crate::brain::Brain, now: i64, 
         if !(p < tau || over || age > hard_age) {
             continue;
         }
-        let mut got = 0;
+        let why = if over {
+            crate::i18n::t("over the size cap").into()
+        } else {
+            crate::i18n::tf("{}% chance you use it again", &[&format!("{:.0}", p * 100.0)])
+        };
         for (path, size) in &g.paths {
-            got += remove_known(path, *size, dry_run);
+            let mut a = Action::new(Kind::Unit, path.clone(), *size, crate::eco::cargo(), age as u64, why.clone());
+            a.reuse = Some(p);
+            plan.push(a);
         }
-        current = current.saturating_sub(got);
-        freed += got;
-        units += 1;
+        current = current.saturating_sub(g.size);
     }
-    say!(
-        "ai gc: {} {} ({units} build units, pressure {pressure}, cut-off {:.0}%) in {}",
-        if dry_run { "would free" } else { "freed" },
-        human(freed),
-        tau * 100.0,
-        shared.display()
-    );
-    Ok(freed)
+    say!("ai gc: planned {} (pressure {pressure}, cut-off {:.0}%) in {}", human(plan.freed()), tau * 100.0, shared.display());
+    Ok(plan)
 }
 
-/// Shrink the shared dir:
+/// Run the AI-guided shrink. Hard limits from Settings still apply.
+pub fn smart_gc(cfg: &crate::config::Config, b: &crate::brain::Brain, now: i64, dry_run: bool) -> Result<u64> {
+    let plan = smart_gc_plan(cfg, b, now)?;
+    let mode = if dry_run { crate::plan::Mode::Preview } else { crate::plan::Mode::Delete };
+    let out = crate::plan::apply(&plan, mode, "gc");
+    say!("ai gc: {} {}", if dry_run { "would free" } else { "freed" }, human(out.freed));
+    Ok(out.freed)
+}
+
+/// Shrink the shared dir, as a plan:
 /// 1. drop incremental caches (pure speed-up data, usually the biggest part)
 /// 2. drop artifacts untouched for `days`
 /// 3. if still over `max_size`, drop oldest artifacts until under it
-pub fn gc(days: u64, max_size: Option<u64>, dry_run: bool) -> Result<u64> {
+pub fn gc_plan(days: u64, max_size: Option<u64>) -> Result<Plan> {
+    let mut plan = Plan::default();
     let Some(shared) = shared_target_dir()? else {
         say!("gc: no shared target dir (run `rtidy setup`), skipping");
-        return Ok(0);
+        return Ok(plan);
     };
     if !shared.is_dir() {
-        return Ok(0);
+        return Ok(plan);
     }
-    let profs = profiles(&shared);
-    let mut freed = 0;
-    for p in &profs {
-        let inc = p.join("incremental");
-        if inc.is_dir() {
-            freed += remove(&inc, dry_run);
-        }
+    for a in incremental_actions(&shared) {
+        plan.push(a);
     }
 
-    // The same build units the model sees, so both the old and the new Cargo layout
-    // are understood in one place, and each unit's size and last-use time are already
-    // measured -- no second walk at delete time.
+    // The same build units the model sees, so both the old and the new Cargo layout are
+    // understood in one place, and each unit's size and last-use time are already
+    // measured — no second walk at delete time.
     let mut units = crate::brain::scan_artifacts(&shared);
     units.sort_unstable_by_key(|g| g.last_use); // oldest first
 
-    let cutoff = crate::brain::now() - (days * 86_400) as i64;
-    let mut current = dir_size(&shared).saturating_sub(if dry_run { freed } else { 0 });
+    let now = crate::brain::now();
+    let cutoff = now - (days * 86_400) as i64;
+    let mut current = dir_size(&shared).saturating_sub(plan.freed());
     for g in units {
         let over = max_size.is_some_and(|m| current > m);
         if g.last_use >= cutoff && !over {
             break; // sorted oldest-first: nothing older remains
         }
-        let mut got = 0;
+        let age = ((now - g.last_use) / 86_400).max(0) as u64;
+        let why = if over {
+            crate::i18n::t("over the size cap").into()
+        } else {
+            crate::i18n::tf("unused for {} days", &[&age.to_string()])
+        };
         for (path, size) in &g.paths {
-            got += remove_known(path, *size, dry_run);
+            plan.push(Action::new(Kind::Unit, path.clone(), *size, crate::eco::cargo(), age, why.clone()));
         }
-        current = current.saturating_sub(got);
-        freed += got;
+        current = current.saturating_sub(g.size);
     }
-    say!(
-        "gc: {} {} in {} (now {})",
-        if dry_run { "would free" } else { "freed" },
-        human(freed),
-        shared.display(),
-        human(current)
-    );
-    Ok(freed)
+    Ok(plan)
+}
+
+/// Shrink the shared dir.
+pub fn gc(days: u64, max_size: Option<u64>, dry_run: bool) -> Result<u64> {
+    let plan = gc_plan(days, max_size)?;
+    let mode = if dry_run { crate::plan::Mode::Preview } else { crate::plan::Mode::Delete };
+    let out = crate::plan::apply(&plan, mode, "gc");
+    say!("gc: {} {}", if dry_run { "would free" } else { "freed" }, human(out.freed));
+    Ok(out.freed)
 }

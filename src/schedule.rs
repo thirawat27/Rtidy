@@ -154,7 +154,7 @@ pub fn run_lock() -> RunLock {
     }
 }
 
-fn parse_at(at: &str) -> Result<(u32, u32)> {
+pub(crate) fn parse_at(at: &str) -> Result<(u32, u32)> {
     let (h, m) = at.trim().split_once(':').context("time must be HH:MM")?;
     let (h, m): (u32, u32) = (h.parse()?, m.parse()?);
     if h > 23 || m > 59 {
@@ -368,6 +368,13 @@ fn program_in_command(line: &str) -> Option<PathBuf> {
         out = out.replace("%%", "%");
     }
     Some(PathBuf::from(out))
+}
+
+/// When a daily clean-up at `at` next starts, from now.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn next_run(at: &str) -> Option<chrono::DateTime<chrono::Local>> {
+    let (h, m) = parse_at(at).ok()?;
+    next_slot(h, m, &chrono::Local::now())
 }
 
 /// Next start of the daily `h:m` slot strictly after `now`, for display.

@@ -59,9 +59,13 @@ fn skip(name: &str) -> bool {
     ) || lower.starts_with('$')
 }
 
-/// A directory holds a Cargo project if it has a `Cargo.toml`.
-fn is_project(dir: &Path) -> bool {
-    dir.join("Cargo.toml").is_file()
+/// A directory holds a project if one of the enabled ecosystems claims it.
+///
+/// With other languages off this is `Cargo.toml` and nothing else, which is what root
+/// discovery meant before the ecosystem table existed. With them on, a machine whose
+/// code lives under a folder full of Node projects finally gets that folder offered.
+fn is_project(dir: &Path, ecos: &[&'static crate::eco::Eco]) -> bool {
+    ecos.iter().any(|e| e.claims(dir))
 }
 
 /// Every place on this OS worth starting a search from.
@@ -100,7 +104,7 @@ pub fn search_seeds() -> Vec<PathBuf> {
 ///
 /// Stops descending once a project is found: a crate's subdirectories belong to that
 /// project, so there is nothing below worth reporting as a separate root.
-fn find_projects(seeds: &[PathBuf], budget: Duration) -> Vec<PathBuf> {
+fn find_projects(seeds: &[PathBuf], budget: Duration, ecos: &[&'static crate::eco::Eco]) -> Vec<PathBuf> {
     let started = Instant::now();
     let mut visited = 0usize;
     let mut projects = Vec::new();
@@ -121,7 +125,7 @@ fn find_projects(seeds: &[PathBuf], budget: Duration) -> Vec<PathBuf> {
                 it.skip_current_dir();
                 continue;
             }
-            if is_project(e.path()) {
+            if is_project(e.path(), ecos) {
                 projects.push(e.path().to_path_buf());
                 it.skip_current_dir();
             }
@@ -135,8 +139,8 @@ fn find_projects(seeds: &[PathBuf], budget: Duration) -> Vec<PathBuf> {
 /// Returns the *parents* of the projects found, so the result is a short list of
 /// places to watch rather than one entry per crate. A folder is dropped when one of
 /// its ancestors is already in the list, so nothing is scanned twice later.
-pub fn discover_roots(budget: Duration) -> Vec<PathBuf> {
-    roots_from(find_projects(&search_seeds(), budget))
+pub fn discover_roots(budget: Duration, ecos: &[&'static crate::eco::Eco]) -> Vec<PathBuf> {
+    roots_from(find_projects(&search_seeds(), budget, ecos))
 }
 
 /// Group project directories into the smallest useful set of parent folders.

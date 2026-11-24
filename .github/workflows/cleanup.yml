@@ -1,0 +1,78 @@
+name: tidy up after the build
+
+# What a run leaves behind on GitHub, after the runner itself is gone:
+#
+#   * artifacts — charged to the account's storage until they expire,
+#   * caches    — held in the repository's 10 GB cache quota.
+#
+# The build workflow keeps both short-lived (see `retention-days` there). This one
+# removes what no longer has any reason to exist at all: the caches of a pull request
+# that has just closed, and, on request, artifacts that are past their usefulness.
+#
+# rtidy's own argument, applied to rtidy's CI: the fix is not to clean more often, it is
+# to stop leaving things behind.
+
+on:
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      older_than_days:
+        description: "Delete build artifacts older than this many days"
+        default: "14"
+        required: false
+
+permissions:
+  actions: write
+
+jobs:
+  caches:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    # A pull request from a fork runs with a read-only token, so the delete would fail
+    # and put a red cross on an otherwise finished pull request. Forks cannot write to
+    # this repository's caches in the first place, so there is nothing of theirs here.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete the caches of the closed pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: refs/pull/${{ github.event.pull_request.number }}/merge
+        run: |
+          # Its branch is gone, so these can never be restored again; left alone they
+          # would sit in the quota until they pushed out a cache still in use.
+          ids=$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/caches?ref=$REF" \
+            --jq '.actions_caches[].id')
+          if [ -z "$ids" ]; then
+            echo "no caches for $REF"
+            exit 0
+          fi
+          for id in $ids; do
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" && echo "deleted cache $id"
+          done
+
+  artifacts:
+    # Run it by hand (Actions → this workflow → Run workflow) to get the storage back
+    # today, rather than waiting for retention to expire on everything already uploaded.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete artifacts older than the chosen age
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DAYS: ${{ inputs.older_than_days }}
+        run: |
+          cutoff=$(date -u -d "$DAYS days ago" +%s)
+          freed=0
+          count=0
+          while read -r id created size name; do
+            [ -z "$id" ] && continue
+            age=$(date -u -d "$created" +%s)
+            if [ "$age" -lt "$cutoff" ]; then
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id" \
+                && echo "deleted $name ($((size / 1024 / 1024)) MB, $created)" \
+                && freed=$((freed + size)) && count=$((count + 1))
+            fi
+          done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts" \
+                     --jq '.artifacts[] | select(.expired == false) | "\(.id) \(.created_at) \(.size_in_bytes) \(.name)"')
+          echo "deleted $count artifact(s), $((freed / 1024 / 1024)) MB" >> "$GITHUB_STEP_SUMMARY"

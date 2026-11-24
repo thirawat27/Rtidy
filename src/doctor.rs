@@ -16,7 +16,7 @@ fn info(msg: &str) {
     println!("  [info] {msg}");
 }
 
-pub fn run(roots: &[PathBuf]) -> Result<()> {
+pub fn run(roots: &[PathBuf], ecos: &[&'static crate::eco::Eco]) -> Result<()> {
     let roots_disp: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
     println!("rtidy doctor  (scanning {})\n", roots_disp.join(", "));
 
@@ -55,21 +55,23 @@ pub fn run(roots: &[PathBuf]) -> Result<()> {
     // --- leftovers and overrides ---
     println!("\nprojects");
     // One pass over the project tree for both the target dirs and the overrides.
-    let scan = targets::scan_tree(roots);
+    let scan = targets::scan_tree(roots, ecos);
     let overrides = scan.overrides;
-    let ts = targets::size_targets(scan.targets);
+    let ts = targets::size_targets(scan.artifacts);
     let total: u64 = ts.iter().map(|t| t.size).sum();
     if ts.is_empty() {
-        ok("no per-project target/ folders");
+        ok("no leftover build folders");
     } else {
-        let msg = format!("{} per-project target/ folders, {}", ts.len(), human(total));
+        let what = if ecos.len() > 1 { "leftover build folders" } else { "per-project target/ folders" };
+        let msg = format!("{} {what}, {}", ts.len(), human(total));
         if shared_dir.is_some() {
             warn(&format!("{msg} (leftovers from before setup)"), "rtidy clean --days 0 <roots>");
         } else {
             warn(&msg, "rtidy setup --lean, then rtidy clean --days 0 <roots>");
         }
         for t in ts.iter().take(5) {
-            println!("         {:>10}  {}", human(t.size), t.path.display());
+            let kind = if ecos.len() > 1 { format!("  {}", t.eco.label) } else { String::new() };
+            println!("         {:>10}  {}{kind}", human(t.size), t.path.display());
         }
     }
     for p in &overrides {
@@ -106,6 +108,14 @@ pub fn run(roots: &[PathBuf]) -> Result<()> {
         );
     } else if !tcs.is_empty() {
         ok(&format!("{} toolchain(s)", tcs.len()));
+    }
+
+    // --- recoverable ---
+    let trash = crate::trash::size();
+    if trash > 0 {
+        println!();
+        println!("recoverable");
+        info(&format!("{} moved aside by earlier clean-ups (rtidy trash)", human(trash)));
     }
 
     // --- automation ---

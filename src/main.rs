@@ -26,15 +26,23 @@ mod cache;
 mod config;
 mod discover;
 mod doctor;
+mod eco;
 mod engine;
 #[cfg(feature = "gui")]
 mod gui;
 mod i18n;
 mod integrate;
+mod ledger;
+mod plan;
+mod preset;
 mod prune;
+mod rules;
 mod schedule;
 mod shared;
+mod stores;
 mod targets;
+mod trash;
+mod watch;
 #[macro_use]
 mod util;
 
@@ -57,6 +65,69 @@ enum Cmd {
     /// trim caches, daily auto clean-up. Uses saved settings (or detected folders).
     Fix {
         /// Project folders (saved for next time). Default: saved or auto-detected
+        roots: Vec<PathBuf>,
+    },
+    /// Show exactly what a clean-up would remove, and remove nothing
+    Plan {
+        roots: Vec<PathBuf>,
+        /// Only count artifacts older than this many days (0 = everything)
+        #[arg(long, default_value_t = 0)]
+        days: u64,
+        /// Machine-readable, for CI and scripts
+        #[arg(long)]
+        json: bool,
+    },
+    /// Put back what the last clean-up moved aside
+    Undo {
+        /// Everything still recoverable, not just the last run
+        #[arg(long)]
+        all: bool,
+    },
+    /// What is recoverable right now, and for how long
+    Trash {
+        /// Delete everything recoverable, now
+        #[arg(long)]
+        empty: bool,
+    },
+    /// Trim after builds stop, instead of once a day (ctrl-c to stop)
+    Watch {
+        /// Check once and exit
+        #[arg(long)]
+        once: bool,
+    },
+    /// Other languages' package stores: where they are, how big, what is stale
+    Stores {
+        /// Drop entries untouched for this many days (default: saved setting)
+        #[arg(long)]
+        days: Option<u64>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Ready-made settings: `rtidy preset` lists them, `rtidy preset ci` applies one
+    Preset {
+        /// careful | balanced | small-disk | workstation | ci
+        name: Option<String>,
+        /// Show what it would change, and change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Which languages rtidy cleans (Rust is always on)
+    Langs {
+        /// Turn an ecosystem on, by id (`rtidy langs` lists them)
+        #[arg(long, value_name = "ID")]
+        on: Vec<String>,
+        /// Turn one off
+        #[arg(long, value_name = "ID")]
+        off: Vec<String>,
+        /// Turn every other language off, back to Rust only
+        #[arg(long, conflicts_with_all = ["on", "off"])]
+        rust_only: bool,
+    },
+    /// Clean until this much is free, for CI runners. Exit 3 if it can't get there.
+    Budget {
+        /// Target free space, e.g. 50G
+        #[arg(value_parser = parse_size)]
+        free: u64,
         roots: Vec<PathBuf>,
     },
     /// Open the app (same as running with no arguments)
@@ -300,18 +371,25 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Doctor { roots } => {
-            let roots = if roots.is_empty() { saved.roots } else { roots };
-            doctor::run(&roots)
+            let ecos = saved.ecos();
+            let roots = if roots.is_empty() { saved.roots.clone() } else { roots };
+            doctor::run(&roots, &ecos)?;
+            if saved.all_langs {
+                println!();
+                println!("package stores");
+                stores::report(&ecos);
+            }
+            Ok(())
         }
         Cmd::Scan { roots, deep } => {
-            targets::scan(&roots_or_cwd(&roots)?, deep);
+            targets::scan(&roots_or_cwd(&roots)?, deep, &saved.ecos());
             Ok(())
         }
         Cmd::Find { timeout, save } => {
             let seeds = discover::search_seeds();
             let shown: Vec<String> = seeds.iter().map(|s| plain(s)).collect();
             println!("searching {} ({}s budget)\n", shown.join(", "), timeout);
-            let found = discover::discover_roots(std::time::Duration::from_secs(timeout));
+            let found = discover::discover_roots(std::time::Duration::from_secs(timeout), &saved.ecos());
             if found.is_empty() {
                 println!("no folders with Cargo projects found");
                 return Ok(());
@@ -329,17 +407,30 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Clean { roots, days, dry_run } => {
-            targets::clean(&roots_or_cwd(&roots)?, days, dry_run);
+            targets::clean(&roots_or_cwd(&roots)?, days, dry_run, &saved.ecos(), saved.trash_days);
             Ok(())
         }
         Cmd::Setup { target_dir, lean, clean_old } => {
             shared::setup(target_dir, lean)?;
             if !clean_old.is_empty() {
-                targets::clean(&clean_old, 0, false);
+                targets::clean(&clean_old, 0, false, &saved.ecos(), saved.trash_days);
             }
             Ok(())
         }
-        Cmd::Gc { days, max_size, dry_run } => shared::gc(days, max_size, dry_run).map(drop),
+        Cmd::Gc { days, max_size, dry_run } => {
+            // Smart mode has a better answer than "older than N days": ask the model
+            // which build units are not coming back. Hard limits still apply.
+            let mut cfg = saved;
+            cfg.gc_days = days;
+            if let Some(m) = max_size {
+                cfg.max_size_gb = m.div_ceil(1 << 30);
+            }
+            if cfg.smart {
+                shared::smart_gc(&cfg, &brain::Brain::load(), brain::now(), dry_run).map(drop)
+            } else {
+                shared::gc(days, cfg.max_size(), dry_run).map(drop)
+            }
+        }
         Cmd::Cache { days, dry_run } => cache::clean(days, dry_run).map(drop),
         Cmd::Auto { opts: o, catch_up } => {
             // Taken before the catch-up check, so a trigger that waits its turn sees the
@@ -395,6 +486,230 @@ fn main() -> Result<()> {
             cfg.save()?;
             println!("daily clean-up at {}; log: {}", cfg.auto_at, util::log_path()?.display());
             println!("missed runs catch up once when the computer is back on; check with `rtidy schedule --status`");
+            Ok(())
+        }
+        Cmd::Plan { roots, days, json } => {
+            let mut cfg = saved;
+            if !roots.is_empty() {
+                cfg.roots = roots.iter().map(|r| util::tidy_abs(r)).collect();
+            }
+            let p = engine::plan_all(&cfg, days, &cfg.ecos());
+            if json {
+                println!("{}", p.to_json());
+                return Ok(());
+            }
+            // Grouped by kind, because the one question this answers is "what happens
+            // to my projects", and a plan that reaches the package stores is hundreds
+            // of entries deep — printed flat, the folders the user asked about were
+            // buried under other people's cache directories.
+            let groups = [
+                (plan::Kind::Artifact, "projects"),
+                (plan::Kind::Incremental, "shared target dir: incremental caches"),
+                (plan::Kind::Unit, "shared target dir: build units"),
+                (plan::Kind::Cache, "cargo download cache"),
+                (plan::Kind::Store, "other languages' package stores"),
+            ];
+            for (kind, title) in groups {
+                let mut of_kind: Vec<&plan::Action> = p.by_kind(kind).collect();
+                // Inside a group, biggest first: the plan as a whole is ordered by value,
+                // but a five-line summary of 700 cache entries should show the big ones.
+                of_kind.sort_unstable_by_key(|a| std::cmp::Reverse(a.size));
+                if of_kind.is_empty() {
+                    continue;
+                }
+                let total: u64 = of_kind.iter().map(|a| a.size).sum();
+                println!("{title}  —  {} in {} item(s)", human(total), of_kind.len());
+                // Every project folder is listed; the caches are summarised, since one
+                // line per entry says nothing a total does not.
+                let cap = if kind == plan::Kind::Artifact { usize::MAX } else { 5 };
+                for a in of_kind.iter().take(cap) {
+                    println!("{}", a.line());
+                }
+                if let Some(rest) = of_kind.len().checked_sub(cap).filter(|n| *n > 0) {
+                    let shown: u64 = of_kind.iter().take(cap).map(|a| a.size).sum();
+                    println!("          … {rest} more, {}", human(total - shown));
+                }
+                println!();
+            }
+            for (path, why) in p.kept.iter().take(plan::LIST_CAP) {
+                println!("{:>10}  keep   {}  ({why})", "-", path.display());
+            }
+            if !p.kept.is_empty() {
+                println!();
+            }
+            for (eco, bytes) in p.by_eco() {
+                let label = eco::by_id(&eco).map(|e| e.label).unwrap_or("other");
+                println!("{:>10}  {label}", human(bytes));
+            }
+            println!();
+            println!("{}", plan::summary(&p));
+            println!("nothing was removed; `rtidy fix` does it");
+            Ok(())
+        }
+        Cmd::Undo { all } => {
+            let (n, bytes) = trash::restore(all)?;
+            if n == 0 {
+                println!("nothing to put back");
+            } else {
+                ledger::Ledger::record_restore(bytes);
+                println!("restored {n} item(s), {}", human(bytes));
+            }
+            Ok(())
+        }
+        Cmd::Trash { empty } => {
+            if empty {
+                let freed = trash::purge(0);
+                println!("freed {}", human(freed));
+                return Ok(());
+            }
+            let items = trash::list();
+            if items.is_empty() {
+                println!("nothing recoverable");
+                return Ok(());
+            }
+            let now = brain::now();
+            for e in &items {
+                let eco = eco::by_id(&e.eco).map(|x| x.label).unwrap_or("");
+                println!("{:>10}  {:>3}d ago  {:<22}  {}", human(e.size), (now - e.when) / 86_400, eco, e.from.display());
+            }
+            let total: u64 = items.iter().map(|e| e.size).sum();
+            println!();
+            println!("{} item(s), {} — kept for {} day(s)", items.len(), human(total), saved.trash_days);
+            println!("`rtidy undo` puts the last clean-up back; `rtidy trash --empty` frees it now");
+            Ok(())
+        }
+        Cmd::Watch { once } => watch::run(&saved, once),
+        Cmd::Stores { days, dry_run } => {
+            let ecos = saved.ecos();
+            stores::report(&ecos);
+            let days = days.unwrap_or(saved.store_days);
+            if days == 0 {
+                println!("trimming is off (store_days = 0 in settings)");
+                return Ok(());
+            }
+            let p = stores::plan(&ecos, days);
+            if p.is_empty() {
+                println!("nothing in them is older than {days} days");
+                return Ok(());
+            }
+            let mode = if dry_run { plan::Mode::Preview } else { plan::Mode::Delete };
+            let out = plan::apply(&p, mode, "stores");
+            println!(
+                "{} {} from {} entries",
+                if dry_run { "would free" } else { "freed" },
+                human(out.freed),
+                out.done
+            );
+            Ok(())
+        }
+        Cmd::Preset { name, dry_run } => {
+            let cfg = saved;
+            let Some(name) = name else {
+                let now = preset::current(&cfg);
+                for p in preset::ALL.iter() {
+                    let mark = if now.is_some_and(|c| c.id == p.id) { "*" } else { " " };
+                    println!("{mark} {:<12} {}", p.id, p.detail());
+                }
+                println!();
+                match now {
+                    Some(p) => println!("current: {}", p.id),
+                    None => println!("current: settings tuned by hand (no preset matches)"),
+                }
+                println!("rtidy preset small-disk   |   rtidy preset ci --dry-run");
+                return Ok(());
+            };
+            let Some(p) = preset::by_id(&name) else {
+                anyhow::bail!("no preset called `{name}` (run `rtidy preset` to list them)");
+            };
+            let rows = p.diff(&cfg);
+            if rows.is_empty() {
+                println!("already on {}: nothing to change", p.id);
+                return Ok(());
+            }
+            println!("{} — {}", p.id, p.detail());
+            for (what, from, to) in &rows {
+                println!("  {:<38} {from}  ->  {to}", i18n::t(what));
+            }
+            if dry_run {
+                println!();
+                println!("nothing was saved; drop --dry-run to apply");
+                return Ok(());
+            }
+            let next = p.over(&cfg);
+            let reschedule = next.auto_enabled != cfg.auto_enabled;
+            next.save()?;
+            if reschedule {
+                engine::apply_schedule(&next)?;
+            }
+            println!();
+            println!("saved to {}", Config::path()?.display());
+            Ok(())
+        }
+        Cmd::Langs { on, off, rust_only } => {
+            let mut cfg = saved;
+            for id in on.iter().chain(off.iter()) {
+                if eco::by_id(id).is_none() {
+                    anyhow::bail!("no ecosystem called `{id}` (run `rtidy langs` to list them)");
+                }
+            }
+            if rust_only {
+                cfg.all_langs = false;
+                cfg.ecos_off.clear();
+            }
+            if !on.is_empty() {
+                cfg.all_langs = true;
+                cfg.ecos_off.retain(|o| !on.contains(o));
+            }
+            let changed = rust_only || !on.is_empty() || !off.is_empty();
+            for id in off {
+                if !cfg.ecos_off.contains(&id) {
+                    cfg.ecos_off.push(id);
+                }
+            }
+            if changed {
+                cfg.save()?;
+            }
+            let live = cfg.ecos();
+            for e in eco::ALL.iter() {
+                let on = live.iter().any(|x| x.id == e.id);
+                let fixed = if e.id == "cargo" { "  (always on)" } else { "" };
+                println!("[{}] {:<10} {}{fixed}", if on { "x" } else { " " }, e.id, e.label);
+            }
+            println!();
+            println!("other languages: {}", if cfg.all_langs { "on" } else { "off" });
+            println!("rtidy langs --on node --on gradle   |   rtidy langs --rust-only");
+            Ok(())
+        }
+        Cmd::Budget { free: target, roots } => {
+            let mut cfg = saved;
+            if !roots.is_empty() {
+                cfg.roots = roots.iter().map(|r| util::tidy_abs(r)).collect();
+            }
+            let place = cfg.roots.first().cloned().or_else(dirs::home_dir).unwrap_or_default();
+            let before = free_space(&place).unwrap_or(0);
+            if before >= target {
+                println!("{} free, already at or above {}", human(before), human(target));
+                return Ok(());
+            }
+            let need = target - before;
+            println!("{} free, need {} more", human(before), human(need));
+            // Best value first, stopping as soon as the budget is met: a CI runner wants
+            // the cheapest set of deletions that gets the build going, not a deep clean.
+            let full = engine::plan_all(&cfg, 0, &cfg.ecos());
+            let mut taken = plan::Plan::default();
+            for a in full.actions {
+                if taken.freed() >= need {
+                    break;
+                }
+                taken.push(a);
+            }
+            let out = plan::apply(&taken, plan::Mode::Delete, "budget");
+            let after = free_space(&place).unwrap_or(before + out.freed);
+            println!("freed {}, now {} free", human(out.freed), human(after));
+            if after < target {
+                println!("could not reach {}", human(target));
+                std::process::exit(3);
+            }
             Ok(())
         }
         Cmd::Log { n } => {

@@ -30,6 +30,25 @@ pub struct Config {
     pub smart: bool,
     /// AI: move the daily clean-up to the hour you build least
     pub smart_schedule: bool,
+    /// Also clean other languages' build output (Node, Gradle, Python, .NET …).
+    ///
+    /// Off by default, and deliberately so: rtidy is a Rust tool, and the shared
+    /// target dir — the thing that stops the mess coming back — only exists for Cargo.
+    /// This is the extra, for the machine that has a `node_modules` problem too.
+    ///
+    /// Nothing turns this on by itself. Not a preset, not an upgrade, not a disk that
+    /// is nearly full: it widens what rtidy may delete, so it waits for the Settings
+    /// switch or `rtidy langs --on <id>`.
+    pub all_langs: bool,
+    /// Ecosystem ids (see `crate::eco`) left out while `all_langs` is on.
+    pub ecos_off: Vec<String>,
+    /// Keep deleted artifacts recoverable for this many days (0 = delete outright).
+    pub trash_days: u64,
+    /// Other languages' package stores: drop entries untouched for this many days
+    /// (0 = never touch them). High on purpose — see `crate::stores`.
+    pub store_days: u64,
+    /// `rtidy watch`: trim after this many minutes with no build activity.
+    pub watch_idle_mins: u64,
 }
 
 impl Default for Config {
@@ -46,13 +65,49 @@ impl Default for Config {
             lang: crate::i18n::detect(),
             smart: true,
             smart_schedule: true,
+            all_langs: false,
+            ecos_off: Vec::new(),
+            // Three days is long enough to notice a mistake and short enough that the
+            // quarantine never becomes the thing filling the disk.
+            trash_days: 3,
+            store_days: 120,
+            watch_idle_mins: 10,
         }
     }
 }
 
+/// Everything rtidy remembers about this machine: settings, the model, the trash index,
+/// the savings ledger.
+///
+/// `RTIDY_HOME` moves the lot somewhere else. That exists because the per-user config
+/// directory is resolved through the OS (the Known Folder API on Windows), so no
+/// environment variable could redirect it, which made rtidy impossible to exercise —
+/// by a test, in CI, or by anyone trying it out — without writing over the real
+/// settings of whoever ran it.
+pub fn state_dir() -> Result<PathBuf> {
+    if let Ok(h) = std::env::var("RTIDY_HOME")
+        && !h.is_empty()
+    {
+        let p = PathBuf::from(h);
+        fs::create_dir_all(&p)?;
+        return Ok(p);
+    }
+    Ok(dirs::config_dir().context("no config dir")?.join("rtidy"))
+}
+
+/// Where the run log and the scan notes go: per-machine scratch, not settings.
+pub fn cache_dir() -> Result<PathBuf> {
+    let dir = match std::env::var("RTIDY_HOME") {
+        Ok(h) if !h.is_empty() => PathBuf::from(h),
+        _ => dirs::cache_dir().context("no cache dir")?.join("rtidy"),
+    };
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 impl Config {
     pub fn path() -> Result<PathBuf> {
-        Ok(dirs::config_dir().context("no config dir")?.join("rtidy").join("config.json"))
+        Ok(state_dir()?.join("config.json"))
     }
 
     pub fn load() -> Self {
@@ -72,6 +127,11 @@ impl Config {
 
     pub fn max_size(&self) -> Option<u64> {
         (self.max_size_gb > 0).then_some(self.max_size_gb << 30)
+    }
+
+    /// The ecosystems this configuration cleans. Always at least Cargo.
+    pub fn ecos(&self) -> Vec<&'static crate::eco::Eco> {
+        crate::eco::enabled(self.all_langs, &self.ecos_off)
     }
 }
 
