@@ -5,6 +5,18 @@ All notable changes to rtidy are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and rtidy uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- The daily clean-up now catches up after the computer was switched off on macOS and
+  on Linux systems using cron, not only after sleep. The launchd agent runs at login
+  and cron gets an `@reboot` line, both through `rtidy auto --catch-up HH:MM`, which
+  cleans only when the latest daily slot was missed (rtidy keeps a `last-auto` stamp
+  next to its log), so a login never cleans twice in one day.
+- On Windows, failing to turn on "run missed task" is now reported instead of being
+  ignored silently.
+
 ## [1.0.0] — 2026-11-22
 
 First release.

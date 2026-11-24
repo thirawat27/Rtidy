@@ -17,7 +17,7 @@ Shared dependencies get compiled again and again, and nothing ever cleans up.
 3. **Removes leftovers** — old per-project `target/` folders (except projects marked *Keep*).
 4. **Trims the shared folder** — drops incremental caches and artifacts you won't reuse, and keeps it under a size cap.
 5. **Trims the cargo download cache** in `~/.cargo`.
-6. **Cleans itself every day** — Task Scheduler (Windows), launchd (macOS), systemd timer or cron (Linux). Missed runs catch up when the computer is back on.
+6. **Cleans itself every day** — Task Scheduler (Windows), launchd (macOS), systemd timer or cron (Linux). Missed runs catch up once, at the next start-up or login.
 
 ## Showcase
 

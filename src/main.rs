@@ -121,7 +121,13 @@ enum Cmd {
         dry_run: bool,
     },
     /// Scheduled clean-up. No arguments = saved settings.
-    Auto(AutoOpts),
+    Auto {
+        #[command(flatten)]
+        opts: AutoOpts,
+        /// Run only if the daily HH:MM slot was missed (used by run-at-login triggers)
+        #[arg(long, value_name = "HH:MM", hide = true)]
+        catch_up: Option<String>,
+    },
     /// Register the daily task (no options = use saved settings)
     Schedule {
         #[arg(long)]
@@ -332,16 +338,24 @@ fn main() -> Result<()> {
         }
         Cmd::Gc { days, max_size, dry_run } => shared::gc(days, max_size, dry_run).map(drop),
         Cmd::Cache { days, dry_run } => cache::clean(days, dry_run).map(drop),
-        Cmd::Auto(o) => {
+        Cmd::Auto { opts: o, catch_up } => {
+            if let Some(at) = catch_up
+                && !schedule::missed(&at)?
+            {
+                return Ok(());
+            }
             util::enable_file_log();
             let cfg = o.to_config()?;
             if let (Some(min), Some(free)) = (o.min_free, cfg.roots.first().and_then(|r| free_space(r)))
                 && free >= min
             {
                 say!("auto: {} free (>= {}), nothing to do", human(free), human(min));
+                schedule::record_run();
                 return Ok(());
             }
-            engine::auto_from_config(&cfg).map(drop)
+            engine::auto_from_config(&cfg)?;
+            schedule::record_run();
+            Ok(())
         }
         Cmd::Schedule { at, remove, opts } => {
             let mut cfg = saved;

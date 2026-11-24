@@ -1,8 +1,15 @@
 //! Daily `rtidy auto`, the native way on every OS:
 //! - Windows: Task Scheduler (per-user, no admin)
-//! - macOS:   launchd LaunchAgent (catches up after sleep)
+//! - macOS:   launchd LaunchAgent (catches up after sleep by itself; after power-off
+//!   through `RunAtLoad` + `auto --catch-up`)
 //! - Linux:   systemd user timer (Persistent=true catches up after power-off),
-//!   falling back to the user's crontab when systemd isn't available.
+//!   falling back to the user's crontab when systemd isn't available (an `@reboot`
+//!   line + `auto --catch-up` covers power-off there).
+//!
+//! `--catch-up HH:MM` makes `auto` run only when the most recent daily slot has not
+//! been covered by a finished run, judged from a stamp each finished `auto` leaves.
+//! That lets a run-at-login trigger share one command with the daily trigger without
+//! cleaning twice.
 
 use crate::util::*;
 use anyhow::{bail, Context, Result};
@@ -37,6 +44,52 @@ pub fn exe_looks_temporary() -> bool {
         let s = p.to_string_lossy();
         s.contains("AppTranslocation") || (cfg!(target_os = "macos") && s.starts_with("/Volumes/"))
     })
+}
+
+/// Where the time of the last finished `auto` is kept (next to the log).
+fn stamp_path() -> Result<PathBuf> {
+    Ok(log_path()?.with_file_name("last-auto"))
+}
+
+fn read_stamp() -> Option<i64> {
+    fs::read_to_string(stamp_path().ok()?).ok()?.trim().parse().ok()
+}
+
+/// Record that a scheduled clean-up just finished.
+pub fn record_run() {
+    if let Ok(p) = stamp_path() {
+        let _ = fs::write(p, chrono::Local::now().timestamp().to_string());
+    }
+}
+
+/// Start of the most recent daily slot at `h:m` (local time), as a unix timestamp.
+/// A trigger that fires a little early still counts as that day's slot.
+fn latest_slot(h: u32, m: u32, now: chrono::DateTime<chrono::Local>) -> Option<i64> {
+    use chrono::{Duration, TimeZone};
+    let probe = now + Duration::minutes(2);
+    let at = |d: chrono::NaiveDate| {
+        let naive = d.and_hms_opt(h, m, 0)?;
+        // A slot inside a DST gap moves to just after it; an ambiguous one takes the first.
+        chrono::Local
+            .from_local_datetime(&naive)
+            .earliest()
+            .or_else(|| chrono::Local.from_local_datetime(&(naive + Duration::hours(1))).earliest())
+    };
+    let today = at(probe.date_naive())?;
+    let slot = if today <= probe { today } else { at(probe.date_naive().pred_opt()?)? };
+    Some(slot.timestamp())
+}
+
+/// Has the most recent `at` slot gone by without a finished run?
+/// With no stamp yet there is nothing to compare against: a baseline is written and the
+/// answer is no, so installing the task or upgrading rtidy never starts a surprise clean-up.
+pub fn missed(at: &str) -> Result<bool> {
+    let (h, m) = parse_at(at)?;
+    let Some(last) = read_stamp() else {
+        record_run();
+        return Ok(false);
+    };
+    Ok(latest_slot(h, m, chrono::Local::now()).is_some_and(|slot| last < slot))
 }
 
 fn parse_at(at: &str) -> Result<(u32, u32)> {
@@ -121,7 +174,7 @@ mod windows {
             bail!("schtasks: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
         // Run missed runs at next start-up, and also on laptop battery.
-        let _ = quiet_cmd("powershell")
+        let ok = quiet_cmd("powershell")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
@@ -130,7 +183,13 @@ mod windows {
                  $s.DisallowStartIfOnBatteries=$false; $s.StopIfGoingOnBatteries=$false; \
                  Set-ScheduledTask -TaskName 'rtidy' -Settings $s | Out-Null",
             ])
-            .status();
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            crate::say!(
+                "warning: could not turn on \"run missed task\"; a daily clean-up missed while the computer is off will be skipped"
+            );
+        }
         Ok(())
     }
 
@@ -177,6 +236,9 @@ mod macos {
         for a in args {
             prog.push_str(&format!("<string>{}</string>", xml_escape(a)));
         }
+        // launchd catches up after sleep but not after power-off. RunAtLoad also starts the
+        // job at every login; `--catch-up` makes that a no-op unless a slot was missed.
+        prog.push_str(&format!("<string>--catch-up</string><string>{h:02}:{m:02}</string>"));
         let log = log_path()?;
         let plist = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -186,6 +248,7 @@ mod macos {
   <key>Label</key><string>{LAUNCHD_LABEL}</string>
   <key>ProgramArguments</key><array>{prog}</array>
   <key>StartCalendarInterval</key><dict><key>Hour</key><integer>{h}</integer><key>Minute</key><integer>{m}</integer></dict>
+  <key>RunAtLoad</key><true/>
   <key>StandardErrorPath</key><string>{}</string>
   <key>ProcessType</key><string>Background</string>
   <key>LowPriorityIO</key><true/>
@@ -279,12 +342,14 @@ mod linux {
             systemctl(&["enable", "--now", "rtidy.timer"])?;
         } else {
             let quoted: Vec<String> = args.iter().map(|a| format!("'{}'", a.replace('\'', "'\\''"))).collect();
-            let line = format!(
-                "{m} {h} * * * '{}' auto {} {CRON_TAG}",
-                exe.display().to_string().replace('\'', "'\\''"),
-                quoted.join(" ")
+            let exe = exe.display().to_string().replace('\'', "'\\''");
+            let args = quoted.join(" ");
+            // cron never runs a missed job; the @reboot line catches up after power-off.
+            let lines = format!(
+                "{m} {h} * * * '{exe}' auto {args} {CRON_TAG}\n\
+                 @reboot '{exe}' auto {args} --catch-up {h:02}:{m:02} {CRON_TAG}"
             );
-            write_crontab(Some(&line))?;
+            write_crontab(Some(&lines))?;
         }
         Ok(())
     }
@@ -337,5 +402,33 @@ mod linux {
             bail!("crontab failed");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Local, TimeZone};
+
+    fn local(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> chrono::DateTime<Local> {
+        Local.with_ymd_and_hms(y, mo, d, h, mi, 0).earliest().unwrap()
+    }
+
+    #[test]
+    fn slot_is_today_once_the_time_has_passed() {
+        let slot = latest_slot(3, 17, local(2026, 3, 10, 9, 0)).unwrap();
+        assert_eq!(slot, local(2026, 3, 10, 3, 17).timestamp());
+    }
+
+    #[test]
+    fn slot_is_yesterday_before_the_time() {
+        let slot = latest_slot(23, 0, local(2026, 3, 10, 9, 0)).unwrap();
+        assert_eq!(slot, local(2026, 3, 9, 23, 0).timestamp());
+    }
+
+    #[test]
+    fn a_slightly_early_trigger_counts_as_todays_slot() {
+        let slot = latest_slot(3, 17, local(2026, 3, 10, 3, 16)).unwrap();
+        assert_eq!(slot, local(2026, 3, 10, 3, 17).timestamp());
     }
 }
