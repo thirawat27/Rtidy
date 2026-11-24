@@ -134,6 +134,9 @@ enum Cmd {
         at: Option<String>,
         #[arg(long)]
         remove: bool,
+        /// Show whether the daily clean-up is on, when it last ran and runs next
+        #[arg(long, conflicts_with_all = ["at", "remove"])]
+        status: bool,
         #[command(flatten)]
         opts: AutoOpts,
     },
@@ -339,12 +342,25 @@ fn main() -> Result<()> {
         Cmd::Gc { days, max_size, dry_run } => shared::gc(days, max_size, dry_run).map(drop),
         Cmd::Cache { days, dry_run } => cache::clean(days, dry_run).map(drop),
         Cmd::Auto { opts: o, catch_up } => {
-            if let Some(at) = catch_up
-                && !schedule::missed(&at)?
+            // Taken before the catch-up check, so a trigger that waits its turn sees the
+            // stamp the earlier run leaves.
+            let _lock = match schedule::run_lock() {
+                schedule::RunLock::Held(f) => f,
+                schedule::RunLock::Busy => {
+                    util::enable_file_log();
+                    say!("auto: another scheduled clean-up is running, skipped");
+                    return Ok(());
+                }
+            };
+            if let Some(at) = &catch_up
+                && !schedule::missed(at)?
             {
                 return Ok(());
             }
             util::enable_file_log();
+            if let Some(at) = &catch_up {
+                say!("auto: the {at} clean-up hasn't run since its last slot, running it now");
+            }
             let cfg = o.to_config()?;
             if let (Some(min), Some(free)) = (o.min_free, cfg.roots.first().and_then(|r| free_space(r)))
                 && free >= min
@@ -357,8 +373,12 @@ fn main() -> Result<()> {
             schedule::record_run();
             Ok(())
         }
-        Cmd::Schedule { at, remove, opts } => {
+        Cmd::Schedule { at, remove, status, opts } => {
             let mut cfg = saved;
+            if status {
+                println!("{}", schedule::status(&cfg.auto_at));
+                return Ok(());
+            }
             if remove {
                 schedule::remove()?;
                 cfg.auto_enabled = false;
@@ -374,6 +394,7 @@ fn main() -> Result<()> {
             cfg.auto_enabled = true;
             cfg.save()?;
             println!("daily clean-up at {}; log: {}", cfg.auto_at, util::log_path()?.display());
+            println!("missed runs catch up once when the computer is back on; check with `rtidy schedule --status`");
             Ok(())
         }
         Cmd::Log { n } => {
@@ -398,4 +419,26 @@ fn wild_args() -> Vec<std::ffi::OsString> {
         attach_console();
     }
     args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn auto_takes_catch_up_with_other_options() {
+        let cli = Cli::try_parse_from(["rtidy", "auto", "/p", "--days", "7", "--catch-up", "03:17"]).unwrap();
+        let Some(Cmd::Auto { catch_up, opts }) = cli.cmd else { panic!("not auto") };
+        assert_eq!(catch_up.as_deref(), Some("03:17"));
+        assert_eq!(opts.days, Some(7));
+    }
+
+    #[test]
+    fn catch_up_is_only_for_auto_and_hidden() {
+        assert!(Cli::try_parse_from(["rtidy", "schedule", "--catch-up", "03:17"]).is_err());
+        let mut cmd = Cli::command();
+        let help = cmd.find_subcommand_mut("auto").unwrap().render_long_help().to_string();
+        assert!(!help.contains("catch-up"));
+    }
 }

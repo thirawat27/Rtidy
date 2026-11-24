@@ -16,6 +16,24 @@ and rtidy uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   next to its log), so a login never cleans twice in one day.
 - On Windows, failing to turn on "run missed task" is now reported instead of being
   ignored silently.
+- Scheduled clean-ups take a lock, so a login trigger and the daily trigger landing
+  together (or the agent reloading itself after smart mode moves the time) can no
+  longer clean the same folders at once.
+- crontab lines escape `%`, which cron otherwise turns into a line break.
+- On Windows the task is registered in one step from a task file instead of
+  `schtasks` followed by PowerShell: changing the schedule is about 2.4× faster, the
+  "run missed task" setting can no longer be left off, a hung run is stopped after
+  4 hours, and long folder lists no longer hit the 261-character command limit.
+- The settings page no longer starts `systemctl` on every frame on Linux.
+- The `last-auto` stamp is replaced atomically, and cron's `@reboot` catch-up waits a
+  minute so network and removable drives are mounted first.
+
+### Added
+
+- `rtidy schedule --status` shows whether the daily clean-up is on, how missed runs
+  catch up on this system, when it last finished and when it runs next. It, and
+  `rtidy doctor`, warn when the task points at a copy of rtidy that no longer exists.
+- Catch-up runs say so in the log.
 
 ## [1.0.0] — 2026-11-22
 

@@ -110,18 +110,21 @@ pub fn run(roots: &[PathBuf]) -> Result<()> {
 
     // --- automation ---
     println!("\nautomation");
-    if cfg!(windows) {
-        let scheduled = std::process::Command::new("schtasks")
-            .args(["/query", "/tn", crate::schedule::TASK_NAME])
-            .output()
-            .is_ok_and(|o| o.status.success());
-        if scheduled { ok("daily task registered") } else { warn("no scheduled clean-up", "rtidy schedule <roots>") }
-        if let Some(d) = &shared_dir {
-            info(&format!(
-                "builds are faster if Defender skips the target dir (admin PowerShell):\n         Add-MpPreference -ExclusionPath \"{}\"",
-                d.display()
-            ));
+    if crate::schedule::is_installed() {
+        match crate::schedule::problem() {
+            Some((what, fix)) => warn(&what, fix),
+            None => ok(&format!("daily clean-up registered ({})", crate::schedule::mechanism())),
         }
+    } else {
+        warn("no scheduled clean-up", "rtidy schedule <roots>");
+    }
+    if cfg!(windows)
+        && let Some(d) = &shared_dir
+    {
+        info(&format!(
+            "builds are faster if Defender skips the target dir (admin PowerShell):\n         Add-MpPreference -ExclusionPath \"{}\"",
+            d.display()
+        ));
     }
     if let Ok(log) = log_path()
         && let Some(last) = read_tail(&log, 8 << 10).lines().last().map(str::to_string)
