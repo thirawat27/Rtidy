@@ -1,6 +1,6 @@
 [package]
 name = "rtidy"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 # The oldest toolchain rtidy is known to build on, checked by compiling against it
 # rather than inferred from the language features it happens to use. Raising this

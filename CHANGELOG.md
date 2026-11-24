@@ -5,7 +5,7 @@ All notable changes to rtidy are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and rtidy uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.0] — 2026-11-24
 
 ### Fixed
 
@@ -27,6 +27,13 @@ and rtidy uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The settings page no longer starts `systemctl` on every frame on Linux.
 - The `last-auto` stamp is replaced atomically, and cron's `@reboot` catch-up waits a
   minute so network and removable drives are mounted first.
+
+- The app's preview could be acted on with one click. The button that carried a plan out
+  sat in the preview's own header, in the same colour as the dashboard's main action, and
+  a single press removed everything listed. It is a secondary button now, it asks a second
+  time with the amount on it, and the preview says plainly that nothing has been removed
+  yet. Carrying a plan out also acts on exactly the list that was shown, rather than
+  scanning again and possibly removing something that was never on screen.
 
 ### Added
 
