@@ -78,6 +78,11 @@ struct App {
     add_path: String,
     /// The plan the Preview tab is showing, if one has been worked out.
     preview: Option<crate::plan::Plan>,
+    /// The preview's remove button has been pressed once and is waiting to be confirmed.
+    ///
+    /// A screen whose whole promise is "nothing has happened yet" cannot also carry a
+    /// single-click delete in the place the eye lands. It asks twice.
+    preview_armed: bool,
 }
 
 /// First-run setup wizard state.
@@ -120,6 +125,7 @@ impl App {
             last_ok: true,
             add_path: String::new(),
             preview: None,
+            preview_armed: false,
         };
         app.refresh(&cc.egui_ctx);
         app
@@ -182,6 +188,25 @@ impl App {
         });
     }
 
+    /// Carry out the plan the preview is showing — that plan, not a fresh one.
+    ///
+    /// `fix_all` would scan again and could act on something the person never saw. This
+    /// removes exactly the list in front of them, and nothing else.
+    fn apply_preview(&mut self, ctx: &egui::Context) {
+        let Some(plan) = self.preview.take() else { return };
+        self.preview_armed = false;
+        self.spawn(ctx, t("Tidying up…"), move |cfg| {
+            crate::trash::purge(cfg.trash_days);
+            let mode = if cfg.trash_days == 0 { crate::plan::Mode::Delete } else { crate::plan::Mode::Trash };
+            let out = crate::plan::apply(&plan, mode, "gui");
+            let freed = human(out.freed + out.quarantined);
+            match out.quarantined {
+                0 => Msg::Done(tf("Freed {}", &[&freed]), true),
+                q => Msg::Done(tf("Freed {} · {} recoverable", &[&freed, &human(q)]), true),
+            }
+        });
+    }
+
     /// Put back whatever the last clean-up moved aside.
     fn undo(&mut self, ctx: &egui::Context) {
         self.spawn(ctx, t("Putting it back…"), |_cfg| match crate::trash::restore(false) {
@@ -212,6 +237,7 @@ impl App {
             }
             Ok(Msg::Planned(p)) => {
                 self.preview = Some(*p);
+                self.preview_armed = false;
                 self.busy = None;
                 self.rx = None;
             }
@@ -711,6 +737,7 @@ impl App {
             return;
         }
 
+        let mut apply = false;
         card(CARD).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -739,14 +766,40 @@ impl App {
                     .response
                     .on_hover_text(made_of.join("\n"));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let b = egui::Button::new(RichText::new(t("Tidy up now")).strong().color(Color32::WHITE))
-                        .fill(ACCENT)
+                    if self.preview_armed {
+                        let b = egui::Button::new(
+                            RichText::new(tf("Yes, remove {}", &[&human(plan.freed())])).strong().color(Color32::WHITE),
+                        )
+                        .fill(WARN)
                         .corner_radius(10)
-                        .min_size(vec2(150.0, 34.0));
-                    if ui.add_enabled(self.busy.is_none(), b).clicked() {
-                        self.fix_all(ctx);
+                        .min_size(vec2(190.0, 36.0));
+                        if ui.add_enabled(self.busy.is_none(), b).clicked() {
+                            apply = true;
+                        }
+                        if ui.add(ghost_button(t("Cancel"))).clicked() {
+                            self.preview_armed = false;
+                        }
+                    } else {
+                        // Not the primary colour: on this screen the primary action is
+                        // reading the list, not acting on it.
+                        let b = egui::Button::new(RichText::new(t("Remove these…")).color(TEXT))
+                            .fill(CARD_HI)
+                            .stroke(Stroke::new(1.0_f32, LINE))
+                            .corner_radius(10)
+                            .min_size(vec2(190.0, 36.0));
+                        if ui.add_enabled(self.busy.is_none(), b).clicked() {
+                            self.preview_armed = true;
+                        }
                     }
                 });
+            });
+            ui.horizontal(|ui| {
+                let (icon, text, color) = if self.preview_armed {
+                    (Icon::Warn, t("This will remove everything listed below."), WARN)
+                } else {
+                    (Icon::Check, t("Nothing has been removed — this is only what would happen."), GOOD)
+                };
+                icon_label(ui, icon, 14.0, color, RichText::new(text).size(12.5).color(color));
             });
             if self.cfg.trash_days > 0 {
                 ui.label(
@@ -806,6 +859,9 @@ impl App {
             .on_hover_text(plan.kept.iter().take(12).map(|(p, w)| format!("{}  ({w})", p.display())).collect::<Vec<_>>().join("\n"));
         }
         self.preview = Some(plan);
+        if apply {
+            self.apply_preview(ctx);
+        }
     }
 
     fn projects(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {

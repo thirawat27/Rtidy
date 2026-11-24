@@ -317,6 +317,30 @@ mod tests {
         assert_eq!((o.freed, o.done, o.quarantined), (1 << 20, 1, 0));
     }
 
+    /// The preview's whole promise. A plan full of real paths, previewed, must leave
+    /// every one of them exactly where it was — not trashed, not deleted, not renamed.
+    #[test]
+    fn preview_leaves_real_files_on_disk() {
+        let dir = std::env::temp_dir().join(format!("rtidy-preview-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut p = Plan::default();
+        for name in ["target", "node_modules", "cache-entry"] {
+            let path = dir.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("blob.bin"), vec![7u8; 2048]).unwrap();
+            p.push(Action::new(Kind::Artifact, path, 2048, crate::eco::cargo(), 99, String::new()));
+        }
+
+        let out = apply(&p, Mode::Preview, "test");
+
+        assert_eq!(out.freed, 3 * 2048, "it still reports what would be freed");
+        assert_eq!(out.quarantined, 0, "and nothing was moved aside either");
+        for a in &p.actions {
+            assert!(a.path.join("blob.bin").is_file(), "{} was touched by a preview", a.path.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn children_of_a_planned_delete_are_recognised() {
         let a = [Action::new(Kind::Artifact, PathBuf::from("/a/target"), 1, crate::eco::cargo(), 0, String::new())];

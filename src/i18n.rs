@@ -356,6 +356,14 @@ const TH: &[(&str, &str)] = &[
     ("Presets", "ชุดตั้งค่าสำเร็จรูป"),
     ("One click sets every limit below; adjust anything afterwards", "กดครั้งเดียวตั้งทุกค่าข้างล่าง แล้วปรับเองทีหลังได้"),
     ("Your own settings — pick a preset to start from one of these instead.", "ค่าที่คุณตั้งเอง — เลือกชุดสำเร็จรูปเพื่อเริ่มจากแบบใดแบบหนึ่งแทนได้"),
+    // the preview asks twice before it removes anything
+    ("Cancel", "ยกเลิก"),
+    ("Remove these…", "ลบตามรายการนี้…"),
+    ("This will remove everything listed below.", "กดแล้วจะลบทุกอย่างในรายการข้างล่างนี้"),
+    ("Nothing has been removed — this is only what would happen.", "ยังไม่มีอะไรถูกลบ — นี่คือสิ่งที่จะเกิดขึ้นเท่านั้น"),
+    ("Freed {}", "คืนพื้นที่ {}"),
+    ("Freed {} · {} recoverable", "คืนพื้นที่ {} · กู้คืนได้ {}"),
+    ("Yes, remove {}", "ยืนยัน ลบ {}"),
 ];
 
 #[cfg(test)]
